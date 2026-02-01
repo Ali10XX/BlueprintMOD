@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blueprint Converter - Minecraft Bedrock</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+
+        body {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+            color: #fff;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            color: #4ade80;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 30px;
+        }
+
+        .upload-zone {
+            border: 3px dashed #4ade80;
+            border-radius: 16px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: rgba(74, 222, 128, 0.05);
+        }
+
+        .upload-zone:hover {
+            background: rgba(74, 222, 128, 0.15);
+            border-color: #22c55e;
+        }
+
+        .upload-zone.dragover {
+            background: rgba(74, 222, 128, 0.25);
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+
+        .upload-text {
+            font-size: 18px;
+            color: #ccc;
+        }
+
+        .upload-hint {
+            font-size: 14px;
+            color: #666;
+            margin-top: 10px;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .result {
+            display: none;
+            margin-top: 30px;
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .result.show {
+            display: block;
+        }
+
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .result-title {
+            color: #4ade80;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .stats {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+
+        .stat {
+            background: #334155;
+            padding: 10px 15px;
+            border-radius: 8px;
+        }
+
+        .stat-label {
+            color: #888;
+            font-size: 12px;
+        }
+
+        .stat-value {
+            color: #fff;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .output-box {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 15px;
+            max-height: 300px;
+            overflow: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            color: #94a3b8;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-weight: 600;
+        }
+
+        .btn-primary {
+            background: #4ade80;
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: #22c55e;
+        }
+
+        .btn-secondary {
+            background: #334155;
+            color: #fff;
+        }
+
+        .btn-secondary:hover {
+            background: #475569;
+        }
+
+        .error {
+            background: #7f1d1d;
+            color: #fca5a5;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            display: none;
+        }
+
+        .error.show {
+            display: block;
+        }
+
+        .instructions {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 30px;
+        }
+
+        .instructions h2 {
+            color: #4ade80;
+            margin-top: 0;
+        }
+
+        .instructions ol {
+            color: #ccc;
+            line-height: 1.8;
+        }
+
+        .instructions code {
+            background: #334155;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+
+        .copy-feedback {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #4ade80;
+            color: #000;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: bold;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+
+        .copy-feedback.show {
+            opacity: 1;
+        }
+
+        @media (max-width: 600px) {
+            .upload-zone {
+                padding: 40px 15px;
+            }
+            .upload-icon {
+                font-size: 48px;
+            }
+            .stats {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📦 Blueprint Converter</h1>
+        <p class="subtitle">Convert .mcstructure files for the Simple Blueprint add-on</p>
+
+        <div class="upload-zone" id="dropZone">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">Drop .mcstructure file here</div>
+            <div class="upload-hint">or click to browse</div>
+            <input type="file" id="fileInput" accept=".mcstructure">
+        </div>
+
+        <div class="error" id="error"></div>
+
+        <div class="result" id="result">
+            <div class="result-header">
+                <span class="result-title" id="resultTitle">Converted!</span>
+            </div>
+
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-label">Blocks</div>
+                    <div class="stat-value" id="statBlocks">0</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Size</div>
+                    <div class="stat-value" id="statSize">0x0x0</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">File Size</div>
+                    <div class="stat-value" id="statFileSize">0 KB</div>
+                </div>
+            </div>
+
+            <div class="output-box" id="output"></div>
+
+            <div class="buttons">
+                <button class="btn-primary" onclick="copyToClipboard()">📋 Copy to Clipboard</button>
+                <button class="btn-secondary" onclick="downloadJson()">⬇️ Download JSON</button>
+            </div>
+        </div>
+
+        <div class="instructions">
+            <h2>How to Use</h2>
+            <ol>
+                <li>Get a <code>.mcstructure</code> file (from Structure Block or download)</li>
+                <li>Upload it here using the box above</li>
+                <li>Copy or download the converted JSON</li>
+                <li>Paste into <code>blueprint_bp/scripts/blueprints.js</code></li>
+                <li>Load in-game with <code>/scriptevent blueprint:load name</code></li>
+            </ol>
+
+            <h2>Where to Find .mcstructure Files</h2>
+            <ol>
+                <li>In Minecraft: <code>/give @s structure_block</code></li>
+                <li>Place the block, set to "Save" mode</li>
+                <li>Define the area and save</li>
+                <li>Find file in: <code>com.mojang/structures/</code></li>
+            </ol>
+        </div>
+    </div>
+
+    <div class="copy-feedback" id="copyFeedback">Copied to clipboard!</div>
+
+    <script>
+    // ============================================================================
+    // NBT PARSER FOR MCSTRUCTURE FILES
+    // ============================================================================
+    // .mcstructure uses little-endian NBT format (different from Java's big-endian)
+
+    class NBTReader {
+        constructor(buffer) {
+            this.buffer = buffer;
+            this.view = new DataView(buffer);
+            this.offset = 0;
+        }
+
+        readByte() {
+            return this.view.getInt8(this.offset++);
+        }
+
+        readUByte() {
+            return this.view.getUint8(this.offset++);
+        }
+
+        readShort() {
+            const val = this.view.getInt16(this.offset, true); // little-endian
+            this.offset += 2;
+            return val;
+        }
+
+        readInt() {
+            const val = this.view.getInt32(this.offset, true);
+            this.offset += 4;
+            return val;
+        }
+
+        readLong() {
+            // JavaScript doesn't handle 64-bit ints well, read as two 32-bit
+            const low = this.view.getUint32(this.offset, true);
+            const high = this.view.getInt32(this.offset + 4, true);
+            this.offset += 8;
+            return high * 0x100000000 + low;
+        }
+
+        readFloat() {
+            const val = this.view.getFloat32(this.offset, true);
+            this.offset += 4;
+            return val;
+        }
+
+        readDouble() {
+            const val = this.view.getFloat64(this.offset, true);
+            this.offset += 8;
+            return val;
+        }
+
+        readString() {
+            const length = this.readShort();
+            if (length < 0 || length > 32767) {
+                throw new Error(`Invalid string length: ${length}`);
+            }
+            const bytes = new Uint8Array(this.buffer, this.offset, length);
+            this.offset += length;
+            return new TextDecoder('utf-8').decode(bytes);
+        }
+
+        readByteArray() {
+            const length = this.readInt();
+            const arr = new Int8Array(this.buffer, this.offset, length);
+            this.offset += length;
+            return Array.from(arr);
+        }
+
+        readIntArray() {
+            const length = this.readInt();
+            const arr = [];
+            for (let i = 0; i < length; i++) {
+                arr.push(this.readInt());
+            }
+            return arr;
+        }
+
+        readLongArray() {
+            const length = this.readInt();
+            const arr = [];
+            for (let i = 0; i < length; i++) {
+                arr.push(this.readLong());
+            }
+            return arr;
+        }
+
+        readTag(tagType) {
+            switch (tagType) {
+                case 0: return null; // TAG_End
+                case 1: return this.readByte();
+                case 2: return this.readShort();
+                case 3: return this.readInt();
+                case 4: return this.readLong();
+                case 5: return this.readFloat();
+                case 6: return this.readDouble();
+                case 7: return this.readByteArray();
+                case 8: return this.readString();
+                case 9: return this.readList();
+                case 10: return this.readCompound();
+                case 11: return this.readIntArray();
+                case 12: return this.readLongArray();
+                default:
+                    throw new Error(`Unknown tag type: ${tagType}`);
+            }
+        }
+
+        readList() {
+            const itemType = this.readByte();
+            const length = this.readInt();
+            const arr = [];
+            for (let i = 0; i < length; i++) {
+                arr.push(this.readTag(itemType));
+            }
+            return arr;
+        }
+
+        readCompound() {
+            const obj = {};
+            while (true) {
+                const tagType = this.readByte();
+                if (tagType === 0) break; // TAG_End
+                const name = this.readString();
+                obj[name] = this.readTag(tagType);
+            }
+            return obj;
+        }
+
+        parse() {
+            // Skip version header (Bedrock NBT starts with version bytes sometimes)
+            // Try to detect and skip header
+            const firstByte = this.view.getUint8(0);
+
+            // Bedrock structures often have a header
+            if (firstByte !== 10) { // 10 = TAG_Compound
+                // Try to find the start of NBT data
+                for (let i = 0; i < Math.min(16, this.buffer.byteLength); i++) {
+                    if (this.view.getUint8(i) === 10) {
+                        this.offset = i;
+                        break;
+                    }
+                }
+            }
+
+            const rootType = this.readByte();
+            if (rootType !== 10) {
+                throw new Error('Invalid NBT: Root must be TAG_Compound');
+            }
+            const rootName = this.readString();
+            return this.readCompound();
+        }
+    }
+
+    // ============================================================================
+    // STRUCTURE PARSER
+    // ============================================================================
+
+    function parseStructure(nbt) {
+        const blocks = [];
+
+        // Get structure data
+        const structure = nbt.structure || nbt;
+
+        // Get size
+        const size = structure.size || [0, 0, 0];
+        const sizeX = size[0] || 0;
+        const sizeY = size[1] || 0;
+        const sizeZ = size[2] || 0;
+
+        // Get block palette
+        const palette = structure.palette?.default?.block_palette || [];
+        const blockNames = palette.map(b => b.name || 'minecraft:air');
+
+        // Get block indices
+        const blockIndices = structure.block_indices || [[]];
+        const layer = blockIndices[0] || [];
+
+        // Parse blocks
+        let idx = 0;
+        for (let y = 0; y < sizeY; y++) {
+            for (let z = 0; z < sizeZ; z++) {
+                for (let x = 0; x < sizeX; x++) {
+                    if (idx < layer.length) {
+                        const blockIdx = layer[idx];
+                        if (blockIdx >= 0 && blockIdx < blockNames.length) {
+                            const blockType = blockNames[blockIdx];
+                            if (blockType !== 'minecraft:air') {
+                                blocks.push({ x, y, z, t: blockType });
+                            }
+                        }
+                    }
+                    idx++;
+                }
+            }
+        }
+
+        return {
+            size: { x: sizeX, y: sizeY, z: sizeZ },
+            blocks
+        };
+    }
+
+    // ============================================================================
+    // COMPRESSION
+    // ============================================================================
+
+    function compressBlocks(blocks) {
+        if (!blocks.length) return { palette: [], data: [] };
+
+        // Create palette
+        const uniqueTypes = [...new Set(blocks.map(b => b.t))];
+        const paletteMap = Object.fromEntries(uniqueTypes.map((t, i) => [t, i]));
+
+        // Sort blocks for better RLE
+        const sorted = blocks.slice().sort((a, b) =>
+            a.y - b.y || a.z - b.z || a.x - b.x
+        );
+
+        // Compress with RLE
+        const compressed = [];
+        let i = 0;
+
+        while (i < sorted.length) {
+            const block = sorted[i];
+            const typeIdx = paletteMap[block.t];
+
+            // Count consecutive same-type blocks in X direction
+            let runLength = 1;
+            while (i + runLength < sorted.length) {
+                const next = sorted[i + runLength];
+                if (next.t === block.t &&
+                    next.y === block.y &&
+                    next.z === block.z &&
+                    next.x === block.x + runLength) {
+                    runLength++;
+                } else {
+                    break;
+                }
+            }
+
+            if (runLength > 2) {
+                // RLE: [x, y, z, type, -length]
+                compressed.push([block.x, block.y, block.z, typeIdx, -runLength]);
+            } else {
+                // Individual blocks
+                for (let j = 0; j < runLength; j++) {
+                    const b = sorted[i + j];
+                    compressed.push([b.x, b.y, b.z, typeIdx]);
+                }
+            }
+
+            i += runLength;
+        }
+
+        return { palette: uniqueTypes, data: compressed };
+    }
+
+    // ============================================================================
+    // UI HANDLERS
+    // ============================================================================
+
+    let convertedData = null;
+    let fileName = 'blueprint';
+
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const resultDiv = document.getElementById('result');
+    const errorDiv = document.getElementById('error');
+    const output = document.getElementById('output');
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('dragover');
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+        const file = e.dataTransfer.files[0];
+        if (file) processFile(file);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) processFile(file);
+    });
+
+    async function processFile(file) {
+        errorDiv.classList.remove('show');
+        resultDiv.classList.remove('show');
+
+        fileName = file.name.replace('.mcstructure', '');
+
+        try {
+            const buffer = await file.arrayBuffer();
+
+            // Parse NBT
+            const reader = new NBTReader(buffer);
+            const nbt = reader.parse();
+
+            // Extract structure
+            const structure = parseStructure(nbt);
+
+            if (structure.blocks.length === 0) {
+                throw new Error('No blocks found in structure (only air?)');
+            }
+
+            // Check size limit
+            const { x, y, z } = structure.size;
+            if (x > 100 || y > 100 || z > 100) {
+                throw new Error(`Structure too large: ${x}x${y}x${z}. Maximum is 100x100x100.`);
+            }
+
+            // Compress
+            const compressed = compressBlocks(structure.blocks);
+
+            // Create output
+            convertedData = {
+                name: fileName,
+                size: structure.size,
+                blockCount: structure.blocks.length,
+                palette: compressed.palette,
+                data: compressed.data
+            };
+
+            // Update UI
+            const jsonStr = JSON.stringify(convertedData, null, 0);
+            document.getElementById('statBlocks').textContent = structure.blocks.length.toLocaleString();
+            document.getElementById('statSize').textContent = `${x}×${y}×${z}`;
+            document.getElementById('statFileSize').textContent = (jsonStr.length / 1024).toFixed(1) + ' KB';
+            document.getElementById('resultTitle').textContent = `✅ ${fileName}`;
+
+            // Show formatted preview
+            output.textContent = JSON.stringify(convertedData, null, 2);
+
+            resultDiv.classList.add('show');
+
+        } catch (err) {
+            console.error(err);
+            errorDiv.textContent = `❌ Error: ${err.message}`;
+            errorDiv.classList.add('show');
+        }
+    }
+
+    function copyToClipboard() {
+        if (!convertedData) return;
+
+        // Format for pasting into blueprints.js
+        const jsonStr = JSON.stringify(convertedData);
+        const formatted = `"${convertedData.name}": ${jsonStr}`;
+
+        navigator.clipboard.writeText(formatted).then(() => {
+            const feedback = document.getElementById('copyFeedback');
+            feedback.classList.add('show');
+            setTimeout(() => feedback.classList.remove('show'), 2000);
+        });
+    }
+
+    function downloadJson() {
+        if (!convertedData) return;
+
+        const jsonStr = JSON.stringify(convertedData);
+        const blob = new Blob([jsonStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${fileName}.json`;
+        a.click();
+
+        URL.revokeObjectURL(url);
+    }
+    </script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Downloads folder (large video files)
+viewer/downloads/
+
+# Temporary files
+*.tmp
+*.temp
+NUL
+
+# yt-dlp binary (can be downloaded separately)
+viewer/yt-dlp.exe
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class

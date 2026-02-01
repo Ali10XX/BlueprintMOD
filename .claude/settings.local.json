@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:heybuilds.com)",
+      "WebSearch",
+      "WebFetch(domain:wiki.bedrock.dev)",
+      "WebFetch(domain:threejsfundamentals.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(npm create:*)",
+      "Bash(npm install)",
+      "Bash(npm install:*)",
+      "Bash(npx tailwindcss:*)",
+      "Bash(node:*)",
+      "Bash(npm run build:*)"
+    ]
+  }
+}
