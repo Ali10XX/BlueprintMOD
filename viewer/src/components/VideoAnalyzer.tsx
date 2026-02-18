@@ -1,15 +1,18 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useBlueprintStore } from '../store/blueprintStore';
+import { useProjectHistoryStore } from '../store/projectHistoryStore';
 import { extractFramesFromVideo, type ExtractedFrame } from '../lib/video/frameExtractor';
-import { initGemini, isGeminiInitialized, analyzeFullVideo, quickAnalyze, setRateLimiterCallback, setLogCallback, getRateLimiterStats, resetRateLimiter, getRequestLog, clearRequestLog, type RequestLogEntry } from '../lib/ai/geminiDetector';
+import { initGemini, isGeminiInitialized, analyzeFullVideo, quickAnalyze, setRateLimiterCallback, setLogCallback, getRateLimiterStats, resetRateLimiter, getRequestLog, clearRequestLog, type RequestLogEntry, type DetectionDebug } from '../lib/ai/geminiDetector';
 import type { Block } from '../types';
 
 type AnalysisStage = 'idle' | 'api-key' | 'uploading' | 'downloading' | 'extracting' | 'analyzing' | 'reviewing' | 'done';
+type InputMode = 'video' | 'image';
 
 const API_BASE = 'http://localhost:3001';
 
 export function VideoAnalyzer() {
   const [stage, setStage] = useState<AnalysisStage>('idle');
+  const [inputMode, setInputMode] = useState<InputMode>('video');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [_videoFile, setVideoFile] = useState<File | null>(null);
@@ -25,8 +28,14 @@ export function VideoAnalyzer() {
   // Request log for debugging
   const [requestLog, setRequestLog] = useState<RequestLogEntry[]>([]);
   const [showRequestLog, setShowRequestLog] = useState(false);
+  // Image upload state
+  const [uploadedImages, setUploadedImages] = useState<File[]>([]);
+  // Debug info from last detection
+  const [debugInfo, setDebugInfo] = useState<DetectionDebug | null>(null);
+  const [showDebugPanel, setShowDebugPanel] = useState(false);
 
   const { setBlocks, blocks } = useBlueprintStore();
+  const { saveProject } = useProjectHistoryStore();
 
   // Set up rate limiter callback to display status to user
   useEffect(() => {
@@ -157,6 +166,64 @@ export function VideoAnalyzer() {
     }
   }, []);
 
+  /**
+   * Handles image file selection (single or multiple)
+   * Converts images to ExtractedFrame format for unified processing
+   */
+  const handleImageSelect = useCallback(async (files: FileList | File[]) => {
+    const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
+    
+    if (imageFiles.length === 0) {
+      setError('No valid image files selected');
+      return;
+    }
+
+    setUploadedImages(imageFiles);
+    setVideoName(imageFiles.length === 1 
+      ? imageFiles[0].name.replace(/\.[^/.]+$/, '')
+      : `${imageFiles.length} images`
+    );
+    setError(null);
+    setStage('extracting');
+    setProgress({ current: 0, total: imageFiles.length });
+
+    try {
+      const extractedFrames: ExtractedFrame[] = [];
+
+      for (let i = 0; i < imageFiles.length; i++) {
+        const file = imageFiles[i];
+        setProgress({ current: i + 1, total: imageFiles.length });
+
+        // Convert image to base64
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+
+        // Extract base64 data (remove data:image/...;base64, prefix)
+        const base64 = dataUrl.split(',')[1];
+
+        extractedFrames.push({
+          index: i,
+          timestamp: i, // Use index as pseudo-timestamp
+          dataUrl,
+          base64,
+        });
+      }
+
+      setFrames(extractedFrames);
+      if (extractedFrames.length > 0) {
+        setPreviewFrame(extractedFrames[0]);
+      }
+      setStage('reviewing');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to process images');
+      setStage('uploading');
+    }
+  }, []);
+
   const handleAnalyze = async () => {
     if (!isGeminiInitialized()) {
       setError('Gemini API not initialized');
@@ -170,9 +237,18 @@ export function VideoAnalyzer() {
     try {
       const blocks = await analyzeFullVideo(
         frames.map(f => f.base64),
-        (current, total, currentBlocks) => {
+        (current, total, currentBlocks, frameResult) => {
+          // ALWAYS update progress - frame advances regardless of success/failure
           setProgress({ current, total });
           setDetectedBlocks([...currentBlocks]);
+          
+          // Log frame result for debugging
+          if (frameResult) {
+            console.log(`[VideoAnalyzer] Frame ${current}/${total}: ${frameResult.success ? 'SUCCESS' : 'FAILED'} - ${frameResult.blocks.length} blocks in ${frameResult.durationMs}ms`);
+            if (frameResult.error) {
+              console.warn(`[VideoAnalyzer] Frame ${current} error: ${frameResult.error}`);
+            }
+          }
         }
       );
 
@@ -182,14 +258,58 @@ export function VideoAnalyzer() {
         const maxX = Math.max(...blocks.map(b => b.x)) + 1;
         const maxY = Math.max(...blocks.map(b => b.y)) + 1;
         const maxZ = Math.max(...blocks.map(b => b.z)) + 1;
+        const size = { x: maxX, y: maxY, z: maxZ };
+        const projectName = videoName || 'Video Build';
 
-        setBlocks(blocks, { x: maxX, y: maxY, z: maxZ }, videoName || 'Video Build');
+        setBlocks(blocks, size, projectName);
+
+        // Save project to history
+        saveProject({
+          name: projectName,
+          source: inputMode,
+          sourceDetails: inputMode === 'video' ? (youtubeUrl || videoName) : `${frames.length} images`,
+          thumbnail: previewFrame?.dataUrl?.substring(0, 5000), // Limit thumbnail size
+          blockCount: blocks.length,
+          size,
+          blocks,
+        });
       }
 
       setStage('done');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Analysis failed');
-      setStage('reviewing');
+      const errorMsg = err instanceof Error ? err.message : 'Analysis failed';
+      
+      // Check for daily quota - show specific message
+      if (errorMsg.includes('Daily API quota') || errorMsg.includes('daily quota')) {
+        setError('🚫 Daily quota exhausted! Analysis stopped. Use the blocks detected so far or wait until tomorrow.');
+      } else {
+        setError(errorMsg);
+      }
+      
+      // If we have some blocks, save partial results and show done stage
+      if (detectedBlocks.length > 0) {
+        const maxX = Math.max(...detectedBlocks.map(b => b.x)) + 1;
+        const maxY = Math.max(...detectedBlocks.map(b => b.y)) + 1;
+        const maxZ = Math.max(...detectedBlocks.map(b => b.z)) + 1;
+        const size = { x: maxX, y: maxY, z: maxZ };
+        const projectName = videoName || 'Partial Build';
+
+        // Save partial project
+        saveProject({
+          name: `${projectName} (partial)`,
+          source: inputMode,
+          sourceDetails: inputMode === 'video' ? (youtubeUrl || videoName) : `${frames.length} images`,
+          thumbnail: previewFrame?.dataUrl?.substring(0, 5000),
+          blockCount: detectedBlocks.length,
+          size,
+          blocks: detectedBlocks,
+          notes: `Partial analysis - ${errorMsg}`,
+        });
+
+        setStage('done');
+      } else {
+        setStage('reviewing');
+      }
     }
   };
 
@@ -197,11 +317,11 @@ export function VideoAnalyzer() {
     if (!previewFrame || !isGeminiInitialized()) return;
 
     setError(null);
+    setDebugInfo(null);
     
     // Show rate limiter stats before request
     const stats = getRateLimiterStats();
     if (stats.waitTimeMs > 0) {
-      // There's a wait time - the rate limiter callback will update the status
       setRateLimitStatus(`Waiting ${Math.ceil(stats.waitTimeMs / 1000)}s for rate limit...`);
     } else if (stats.requestsInLastMinute > 0) {
       setRateLimitStatus(`Analyzing... (${stats.requestsInLastMinute}/${stats.maxRequestsPerMinute} requests used)`);
@@ -213,20 +333,26 @@ export function VideoAnalyzer() {
       const result = await quickAnalyze(previewFrame.base64);
       setDetectedBlocks(result.blocks);
       setRateLimitStatus(null);
+      
+      // Store debug info for display
+      setDebugInfo(result.debug);
 
       if (result.blocks.length > 0) {
         const maxX = Math.max(...result.blocks.map(b => b.x)) + 1;
         const maxY = Math.max(...result.blocks.map(b => b.y)) + 1;
         const maxZ = Math.max(...result.blocks.map(b => b.z)) + 1;
         setBlocks(result.blocks, { x: maxX, y: maxY, z: maxZ }, 'Quick Test');
+      } else {
+        // Show debug info when no blocks detected
+        const debugMsg = result.debug.reasonIfZeroBlocks || result.debug.imageSummary;
+        setError(`No blocks detected: ${debugMsg}`);
       }
     } catch (err) {
       setRateLimitStatus(null);
       const errorMsg = err instanceof Error ? err.message : 'Quick test failed';
       
-      // Check for daily quota exhaustion
       if (errorMsg.includes('Daily API quota') || errorMsg.includes('daily quota')) {
-        setError('🚫 Daily quota exhausted! The Gemini free tier limit has been reached. Please wait until tomorrow or use a different API key.');
+        setError('🚫 Daily quota exhausted! Please wait until tomorrow or use a different API key.');
       } else if (errorMsg.includes('429') || errorMsg.includes('quota') || errorMsg.includes('rate')) {
         setError('Rate limit exceeded. Please wait a minute before trying again.');
       } else {
@@ -237,6 +363,7 @@ export function VideoAnalyzer() {
 
   const reset = () => {
     setStage('idle');
+    setInputMode('video');
     setVideoFile(null);
     setVideoName('');
     setYoutubeUrl('');
@@ -246,6 +373,9 @@ export function VideoAnalyzer() {
     setError(null);
     setDownloadStatus('');
     setRateLimitStatus(null);
+    setUploadedImages([]);
+    setDebugInfo(null);
+    setShowDebugPanel(false);
     // Reset rate limiter state to clear any stale backoff
     resetRateLimiter();
   };
@@ -318,53 +448,153 @@ export function VideoAnalyzer() {
         </div>
       )}
 
-      {/* Video upload / YouTube URL */}
+      {/* Video/Image upload */}
       {stage === 'uploading' && (
         <div className="bg-slate-800/90 backdrop-blur rounded-xl p-6 text-white shadow-xl max-w-md">
-          <h3 className="text-lg font-bold text-green-400 mb-3">Choose Video Source</h3>
+          <h3 className="text-lg font-bold text-green-400 mb-3">Choose Input Source</h3>
 
-          {/* YouTube URL input */}
-          <div className="mb-4">
-            <label className="text-sm text-gray-400 block mb-2">YouTube URL</label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={youtubeUrl}
-                onChange={(e) => setYoutubeUrl(e.target.value)}
-                placeholder="https://youtube.com/watch?v=..."
-                className="flex-1 bg-slate-700 rounded-lg px-3 py-2 text-white placeholder-gray-500 text-sm"
-              />
-              <button
-                onClick={handleYoutubeDownload}
-                disabled={!youtubeUrl.trim()}
-                className="bg-red-500 hover:bg-red-600 disabled:bg-slate-600 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-lg transition-colors"
-              >
-                Download
-              </button>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">
-              Requires server running: <code className="bg-slate-700 px-1 rounded">node server.js</code>
-            </p>
+          {/* Mode toggle */}
+          <div className="flex gap-2 mb-4">
+            <button
+              onClick={() => setInputMode('video')}
+              className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+                inputMode === 'video'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-slate-700 text-gray-300 hover:bg-slate-600'
+              }`}
+            >
+              📹 Video
+            </button>
+            <button
+              onClick={() => setInputMode('image')}
+              className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+                inputMode === 'image'
+                  ? 'bg-purple-600 text-white'
+                  : 'bg-slate-700 text-gray-300 hover:bg-slate-600'
+              }`}
+            >
+              🖼️ Images
+            </button>
           </div>
 
-          <div className="flex items-center gap-3 my-4">
-            <div className="flex-1 h-px bg-slate-600"></div>
-            <span className="text-gray-500 text-sm">or</span>
-            <div className="flex-1 h-px bg-slate-600"></div>
-          </div>
+          {inputMode === 'video' ? (
+            <>
+              {/* YouTube URL input */}
+              <div className="mb-4">
+                <label className="text-sm text-gray-400 block mb-2">YouTube URL</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={youtubeUrl}
+                    onChange={(e) => setYoutubeUrl(e.target.value)}
+                    placeholder="https://youtube.com/watch?v=..."
+                    className="flex-1 bg-slate-700 rounded-lg px-3 py-2 text-white placeholder-gray-500 text-sm"
+                  />
+                  <button
+                    onClick={handleYoutubeDownload}
+                    disabled={!youtubeUrl.trim()}
+                    className="bg-red-500 hover:bg-red-600 disabled:bg-slate-600 disabled:cursor-not-allowed text-white font-bold py-2 px-4 rounded-lg transition-colors"
+                  >
+                    Download
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Requires server running: <code className="bg-slate-700 px-1 rounded">node server.js</code>
+                </p>
+              </div>
 
-          {/* Local file upload */}
-          <label className="block">
-            <span className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg cursor-pointer inline-block transition-colors">
-              Upload Local Video
-            </span>
-            <input
-              type="file"
-              accept="video/*"
-              onChange={(e) => e.target.files?.[0] && handleVideoSelect(e.target.files[0])}
-              className="hidden"
-            />
-          </label>
+              <div className="flex items-center gap-3 my-4">
+                <div className="flex-1 h-px bg-slate-600"></div>
+                <span className="text-gray-500 text-sm">or</span>
+                <div className="flex-1 h-px bg-slate-600"></div>
+              </div>
+
+              {/* Local video upload */}
+              <label className="block">
+                <span className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg cursor-pointer inline-block transition-colors">
+                  Upload Local Video
+                </span>
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={(e) => e.target.files?.[0] && handleVideoSelect(e.target.files[0])}
+                  className="hidden"
+                />
+              </label>
+            </>
+          ) : (
+            <>
+              {/* Image upload section */}
+              <div className="mb-4">
+                <p className="text-sm text-gray-400 mb-3">
+                  Upload one or more images of your Minecraft build. For best results, include
+                  multiple angles of the structure.
+                </p>
+
+                {/* Single image */}
+                <label className="block mb-3">
+                  <span className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg cursor-pointer inline-block transition-colors">
+                    Upload Single Image
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => e.target.files && handleImageSelect(e.target.files)}
+                    className="hidden"
+                  />
+                </label>
+
+                <div className="flex items-center gap-3 my-3">
+                  <div className="flex-1 h-px bg-slate-600"></div>
+                  <span className="text-gray-500 text-sm">or</span>
+                  <div className="flex-1 h-px bg-slate-600"></div>
+                </div>
+
+                {/* Multiple images */}
+                <label className="block">
+                  <span className="bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg cursor-pointer inline-block transition-colors">
+                    Upload Multiple Images
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={(e) => e.target.files && handleImageSelect(e.target.files)}
+                    className="hidden"
+                  />
+                </label>
+
+                <p className="text-xs text-gray-500 mt-3">
+                  Tip: Screenshots from different angles will produce more accurate blueprints
+                </p>
+              </div>
+
+              {/* Preview uploaded images */}
+              {uploadedImages.length > 0 && (
+                <div className="mt-4 p-3 bg-slate-700 rounded-lg">
+                  <p className="text-sm text-gray-400 mb-2">
+                    {uploadedImages.length} image{uploadedImages.length !== 1 ? 's' : ''} selected
+                  </p>
+                  <div className="flex gap-2 overflow-x-auto pb-2">
+                    {uploadedImages.slice(0, 5).map((file, i) => (
+                      <div key={i} className="flex-shrink-0 w-12 h-12 bg-slate-600 rounded overflow-hidden">
+                        <img
+                          src={URL.createObjectURL(file)}
+                          alt={`Preview ${i + 1}`}
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                    ))}
+                    {uploadedImages.length > 5 && (
+                      <div className="flex-shrink-0 w-12 h-12 bg-slate-600 rounded flex items-center justify-center text-gray-400 text-xs">
+                        +{uploadedImages.length - 5}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
 
           {error && <p className="mt-3 text-red-400 text-sm">{error}</p>}
 
@@ -478,10 +708,146 @@ export function VideoAnalyzer() {
             </div>
           )}
 
-          {detectedBlocks.length > 0 && (
-            <p className="text-gray-400 text-sm mb-3">
-              Detected {detectedBlocks.length} blocks
-            </p>
+          {/* Detection Result */}
+          {detectedBlocks.length > 0 ? (
+            <div className="mb-3 p-3 bg-green-900/30 border border-green-700/50 rounded-lg">
+              <p className="text-green-400 font-medium flex items-center gap-2">
+                <span className="text-lg">✓</span>
+                Detected {detectedBlocks.length} blocks
+              </p>
+            </div>
+          ) : debugInfo && (
+            /* Zero Blocks Detected - Show Debug Info Prominently */
+            <div className="mb-3 p-3 bg-red-900/30 border border-red-700/50 rounded-lg">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-lg">⚠️</span>
+                <span className="text-red-400 font-medium">Zero Blocks Detected</span>
+                <span className={`ml-auto px-2 py-0.5 rounded text-xs ${
+                  debugInfo.confidence === 'high' ? 'bg-green-900 text-green-400' :
+                  debugInfo.confidence === 'medium' ? 'bg-yellow-900 text-yellow-400' :
+                  debugInfo.confidence === 'low' ? 'bg-orange-900 text-orange-400' :
+                  'bg-red-900 text-red-400'
+                }`}>
+                  {debugInfo.confidence} confidence
+                </span>
+              </div>
+
+              {/* Reason for Zero Blocks - Always visible when present */}
+              {debugInfo.reasonIfZeroBlocks && (
+                <div className="mb-3 p-2 bg-red-950/50 rounded">
+                  <span className="text-red-300 text-xs font-medium">Reason:</span>
+                  <p className="text-red-200 text-sm mt-1">{debugInfo.reasonIfZeroBlocks}</p>
+                </div>
+              )}
+
+              {/* Image Summary - Always visible */}
+              <div className="mb-3 p-2 bg-slate-800/50 rounded">
+                <span className="text-gray-400 text-xs font-medium">What AI Saw:</span>
+                <p className="text-gray-200 text-sm mt-1">{debugInfo.imageSummary}</p>
+              </div>
+
+              {/* Grid Assumptions - Always visible when present */}
+              {debugInfo.gridAssumptions && (
+                <div className="mb-3 p-2 bg-slate-800/50 rounded">
+                  <span className="text-gray-400 text-xs font-medium">Grid Analysis:</span>
+                  <div className="mt-1 grid grid-cols-2 gap-2 text-xs">
+                    <div>
+                      <span className="text-gray-500">Grid Size:</span>
+                      <span className="text-gray-200 ml-1">
+                        {debugInfo.gridAssumptions.estimatedGridWidth}×{debugInfo.gridAssumptions.estimatedGridDepth}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Block Size:</span>
+                      <span className="text-gray-200 ml-1">
+                        ~{debugInfo.gridAssumptions.estimatedBlockSizePixels}px
+                      </span>
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-gray-500">View Angle:</span>
+                      <span className="text-gray-200 ml-1">{debugInfo.gridAssumptions.viewAngle}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Collapsible Raw Response */}
+              <div className="border-t border-slate-700 pt-2 mt-2">
+                <button
+                  onClick={() => setShowDebugPanel(!showDebugPanel)}
+                  className="text-xs text-gray-400 hover:text-white flex items-center gap-1 w-full"
+                >
+                  {showDebugPanel ? '▼' : '▶'} Raw Response
+                  <span className={`ml-2 px-1.5 py-0.5 rounded text-xs ${
+                    debugInfo.parseSuccessful ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'
+                  }`}>
+                    {debugInfo.responseFormat} {debugInfo.parseSuccessful ? '✓' : '✗'}
+                  </span>
+                </button>
+                
+                {showDebugPanel && (
+                  <pre className="mt-2 p-2 bg-slate-900 rounded text-xs text-gray-400 overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap break-all">
+                    {debugInfo.rawResponsePreview.substring(0, 300)}
+                    {debugInfo.rawResponsePreview.length > 300 && '...'}
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Debug Info Panel - Show when blocks > 0 but debug available */}
+          {debugInfo && detectedBlocks.length > 0 && (
+            <div className="mb-3">
+              <button
+                onClick={() => setShowDebugPanel(!showDebugPanel)}
+                className="text-xs text-gray-400 hover:text-white flex items-center gap-1"
+              >
+                {showDebugPanel ? '▼' : '▶'} Debug Info
+                <span className={`ml-1 px-1.5 py-0.5 rounded text-xs ${
+                  debugInfo.confidence === 'high' ? 'bg-green-900 text-green-400' :
+                  debugInfo.confidence === 'medium' ? 'bg-yellow-900 text-yellow-400' :
+                  debugInfo.confidence === 'low' ? 'bg-orange-900 text-orange-400' :
+                  'bg-red-900 text-red-400'
+                }`}>
+                  {debugInfo.confidence}
+                </span>
+              </button>
+              
+              {showDebugPanel && (
+                <div className="mt-2 p-3 bg-slate-900 rounded-lg text-xs space-y-2">
+                  <div>
+                    <span className="text-gray-500">Image Summary:</span>
+                    <p className="text-gray-300">{debugInfo.imageSummary}</p>
+                  </div>
+                  
+                  {debugInfo.gridAssumptions && (
+                    <div>
+                      <span className="text-gray-500">Grid Assumptions:</span>
+                      <p className="text-gray-300">
+                        {debugInfo.gridAssumptions.estimatedGridWidth}×{debugInfo.gridAssumptions.estimatedGridDepth} grid, 
+                        ~{debugInfo.gridAssumptions.estimatedBlockSizePixels}px/block, 
+                        view: {debugInfo.gridAssumptions.viewAngle}
+                      </p>
+                    </div>
+                  )}
+                  
+                  <div>
+                    <span className="text-gray-500">Response Format:</span>
+                    <span className={`ml-2 ${debugInfo.parseSuccessful ? 'text-green-400' : 'text-red-400'}`}>
+                      {debugInfo.responseFormat} {debugInfo.parseSuccessful ? '✓' : '✗'}
+                    </span>
+                  </div>
+                  
+                  <div>
+                    <span className="text-gray-500">Raw Response (first 300 chars):</span>
+                    <pre className="mt-1 p-2 bg-slate-800 rounded text-xs text-gray-400 overflow-x-auto max-h-24 overflow-y-auto whitespace-pre-wrap break-all">
+                      {debugInfo.rawResponsePreview.substring(0, 300)}
+                      {debugInfo.rawResponsePreview.length > 300 && '...'}
+                    </pre>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           <div className="flex gap-2 flex-wrap">
@@ -654,9 +1020,9 @@ export function VideoAnalyzer() {
                           {entry.errorMessage}
                         </div>
                       )}
-                      {entry.retryCount > 0 && (
+                      {entry.attempt > 1 && (
                         <div className="text-yellow-400 mt-1">
-                          Retry attempt #{entry.retryCount}
+                          Attempt {entry.attempt}/{entry.maxAttempts}
                         </div>
                       )}
                     </div>

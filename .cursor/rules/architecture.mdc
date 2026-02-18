@@ -1,0 +1,58 @@
+---
+alwaysApply: true
+---
+# Blueprint System Architecture Rules
+
+## Core Principle: AI is Optional
+
+The system MUST work without AI. AI features are enhancements, not requirements.
+
+### Deterministic Core (No AI)
+- File import: .mcstructure, .json, .schematic
+- 3D visualization
+- Layer-by-layer viewing
+- Materials list generation
+- Export to all formats
+- Minecraft game sync via WebSocket
+
+### Optional AI Features (Can Fail Gracefully)
+- Block type identification from screenshots (NOT coordinates)
+- Build style analysis
+- Similar build suggestions
+
+## Control Flow Rules
+
+### Single Run Controller
+All analysis operations MUST go through runController.ts:
+- One active run at a time
+- New run cancels previous run
+- Hard API call limit (25 per run)
+- Explicit state machine: idle -> preparing -> analyzing -> complete/failed/cancelled
+
+### No Retry on Zero Results
+If AI returns 0 blocks, that is a TERMINAL state. Do not retry.
+Zero blocks = honest uncertainty, not a transient error.
+
+### API Call Rules
+1. Every API call MUST be recorded via runController.recordApiCall()
+2. Calls blocked if run is cancelled or limit exceeded
+3. All async operations MUST respect the abort signal
+
+## Failure Categories
+
+Category | Retry | User Message
+---------|-------|-------------
+user_cancelled | No | Analysis was cancelled.
+input_invalid | No | The input file could not be processed.
+api_error | Yes once | AI service error. Try again.
+api_quota_exceeded | No | Daily limit reached. Try tomorrow.
+parse_error | No | AI response could not be understood.
+zero_results | No | No blocks detected in the image.
+timeout | No | Analysis took too long.
+
+## File References
+
+- Run Controller: viewer/src/lib/core/runController.ts
+- Gemini Integration: viewer/src/lib/ai/geminiDetector.ts
+- Rate Limiter: viewer/src/lib/ai/rateLimiter.ts
+- Video Analyzer UI: viewer/src/components/VideoAnalyzer.tsx

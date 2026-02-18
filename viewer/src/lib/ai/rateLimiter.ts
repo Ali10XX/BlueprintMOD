@@ -1,118 +1,104 @@
 /**
- * rateLimiter.ts - Rate limiter for Gemini API calls
+ * rateLimiter.ts - Production-grade rate limiter for Gemini API
  * 
- * This module handles rate limiting to prevent 429 errors from the Gemini API.
- * It tracks request timestamps, logs all requests, and implements exponential backoff.
+ * Design principles:
+ * - NO global retry state - each request manages its own retries
+ * - Always resolve OR throw - never hang
+ * - Timeout on all waits - cannot block forever
+ * - Observable - every state transition is logged
  */
 
-// Configuration for rate limiting
-const CONFIG = {
-  // Maximum requests per minute (Gemini free tier limit is 15 RPM)
-  MAX_REQUESTS_PER_MINUTE: 15,
-  // Minimum delay between requests in ms (safety buffer)
-  MIN_DELAY_BETWEEN_REQUESTS: 4500, // ~13 requests per minute to stay safe
-  // Maximum retry attempts on 429 errors
-  MAX_RETRIES: 3,
-  // Initial backoff delay in ms
-  INITIAL_BACKOFF_MS: 5000,
-  // Maximum backoff delay in ms
-  MAX_BACKOFF_MS: 60000,
-};
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
 
-// Request log entry interface
+const CONFIG = {
+  MAX_REQUESTS_PER_MINUTE: 15,
+  MIN_DELAY_MS: 500,
+  REQUEST_TIMEOUT_MS: 30000,      // 30s max for any single API call
+  MAX_WAIT_MS: 10000,             // 10s max wait for rate limit
+  INITIAL_BACKOFF_MS: 2000,
+  MAX_BACKOFF_MS: 10000,          // Cap backoff at 10s, not 60s
+  MAX_RETRIES: 2,                 // 3 total attempts (1 initial + 2 retries)
+} as const;
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
 export interface RequestLogEntry {
   id: number;
   timestamp: Date;
   status: 'pending' | 'success' | 'error';
   errorMessage?: string;
-  errorType?: 'rate_limit' | 'daily_quota' | 'other';
+  errorType?: 'rate_limit' | 'daily_quota' | 'timeout' | 'other';
   duration?: number;
-  retryCount: number;
+  attempt: number;
+  maxAttempts: number;
 }
 
-// Store timestamps of recent requests
+export interface RateLimitResult {
+  shouldProceed: boolean;
+  waitedMs: number;
+  reason?: string;
+}
+
+type StatusCallback = (message: string, waitTime?: number) => void;
+type LogCallback = (log: RequestLogEntry[]) => void;
+
+// ============================================================================
+// STATE (only for tracking, NOT for retry logic)
+// ============================================================================
+
 let requestTimestamps: number[] = [];
-
-// Current backoff state
-let currentBackoffMs = 0;
-let consecutiveErrors = 0;
-
-// Request history log
 let requestLog: RequestLogEntry[] = [];
 let requestIdCounter = 0;
-
-// Callback for status updates
-type StatusCallback = (message: string, waitTime?: number) => void;
 let statusCallback: StatusCallback | null = null;
-
-// Callback for log updates
-type LogCallback = (log: RequestLogEntry[]) => void;
 let logCallback: LogCallback | null = null;
 
-/**
- * Sets a callback function to receive rate limiter status updates
- * @param callback - Function to call with status updates
- */
+// ============================================================================
+// CALLBACKS
+// ============================================================================
+
 export function setRateLimiterCallback(callback: StatusCallback | null): void {
   statusCallback = callback;
 }
 
-/**
- * Sets a callback function to receive log updates
- * @param callback - Function to call when log changes
- */
 export function setLogCallback(callback: LogCallback | null): void {
   logCallback = callback;
 }
 
-/**
- * Reports status to the callback if one is set
- * @param message - Status message to report
- * @param waitTime - Optional wait time in seconds
- */
 function reportStatus(message: string, waitTime?: number): void {
-  console.log(`[RateLimiter] ${message}`);
-  if (statusCallback) {
-    statusCallback(message, waitTime);
-  }
+  console.log(`[RateLimiter] rateLimiter.ts: ${message}`);
+  statusCallback?.(message, waitTime);
 }
 
-/**
- * Notifies the log callback of changes
- */
 function notifyLogUpdate(): void {
-  if (logCallback) {
-    logCallback([...requestLog]);
-  }
+  logCallback?.([...requestLog]);
 }
 
-/**
- * Starts tracking a new request
- * @returns The request log entry ID
- */
-export function startRequest(): number {
+// ============================================================================
+// REQUEST LOGGING
+// ============================================================================
+
+export function startRequest(attempt: number, maxAttempts: number): number {
   const id = ++requestIdCounter;
   const entry: RequestLogEntry = {
     id,
     timestamp: new Date(),
     status: 'pending',
-    retryCount: consecutiveErrors,
+    attempt,
+    maxAttempts,
   };
   requestLog.push(entry);
-  // Keep only last 50 entries
   if (requestLog.length > 50) {
     requestLog = requestLog.slice(-50);
   }
   notifyLogUpdate();
-  console.log(`[RateLimiter] Request #${id} started (retry: ${consecutiveErrors})`);
+  console.log(`[RateLimiter] rateLimiter.ts: Request #${id} started (attempt ${attempt}/${maxAttempts})`);
   return id;
 }
 
-/**
- * Marks a request as successful
- * @param id - The request ID
- * @param duration - How long the request took in ms
- */
 export function completeRequest(id: number, duration: number): void {
   const entry = requestLog.find(e => e.id === id);
   if (entry) {
@@ -120,16 +106,14 @@ export function completeRequest(id: number, duration: number): void {
     entry.duration = duration;
   }
   notifyLogUpdate();
-  console.log(`[RateLimiter] Request #${id} completed in ${duration}ms`);
+  console.log(`[RateLimiter] rateLimiter.ts: Request #${id} completed in ${duration}ms`);
 }
 
-/**
- * Marks a request as failed
- * @param id - The request ID
- * @param errorMessage - The error message
- * @param errorType - Type of error
- */
-export function failRequest(id: number, errorMessage: string, errorType: 'rate_limit' | 'daily_quota' | 'other'): void {
+export function failRequest(
+  id: number, 
+  errorMessage: string, 
+  errorType: 'rate_limit' | 'daily_quota' | 'timeout' | 'other'
+): void {
   const entry = requestLog.find(e => e.id === id);
   if (entry) {
     entry.status = 'error';
@@ -137,150 +121,136 @@ export function failRequest(id: number, errorMessage: string, errorType: 'rate_l
     entry.errorType = errorType;
   }
   notifyLogUpdate();
-  console.log(`[RateLimiter] Request #${id} failed: [${errorType}] ${errorMessage.substring(0, 100)}...`);
+  console.log(`[RateLimiter] rateLimiter.ts: Request #${id} failed: [${errorType}] ${errorMessage.substring(0, 100)}`);
 }
 
-/**
- * Gets the full request log
- * @returns Array of request log entries
- */
 export function getRequestLog(): RequestLogEntry[] {
   return [...requestLog];
 }
 
-/**
- * Clears the request log
- */
 export function clearRequestLog(): void {
   requestLog = [];
   requestIdCounter = 0;
   notifyLogUpdate();
 }
 
-/**
- * Cleans up old request timestamps (older than 1 minute)
- */
+// ============================================================================
+// RATE LIMITING (stateless per-request)
+// ============================================================================
+
 function cleanupOldTimestamps(): void {
   const oneMinuteAgo = Date.now() - 60000;
   requestTimestamps = requestTimestamps.filter(ts => ts > oneMinuteAgo);
 }
 
-/**
- * Gets the number of requests made in the last minute
- * @returns Number of requests in the last minute
- */
 export function getRequestsInLastMinute(): number {
   cleanupOldTimestamps();
   return requestTimestamps.length;
 }
 
 /**
- * Calculates how long to wait before the next request can be made
- * @returns Wait time in milliseconds
+ * Calculates wait time based on CURRENT state only.
+ * Does NOT use any retry counters.
  */
-export function getWaitTimeMs(): number {
+function calculateWaitTime(): number {
   cleanupOldTimestamps();
   
-  // If we have a backoff from a 429 error, use that
-  if (currentBackoffMs > 0) {
-    return currentBackoffMs;
-  }
-  
-  // If we haven't made any requests, no wait needed
   if (requestTimestamps.length === 0) {
     return 0;
   }
   
-  // Check if we're at the rate limit
+  // At rate limit? Wait for oldest to expire
   if (requestTimestamps.length >= CONFIG.MAX_REQUESTS_PER_MINUTE) {
-    // Wait until the oldest request falls out of the 1-minute window
     const oldestTimestamp = requestTimestamps[0];
     const waitUntil = oldestTimestamp + 60000;
-    const waitTime = waitUntil - Date.now();
-    return Math.max(0, waitTime + 1000); // Add 1s buffer
+    return Math.max(0, waitUntil - Date.now() + 500);
   }
   
-  // Ensure minimum delay between requests
+  // Minimum delay between requests
   const lastTimestamp = requestTimestamps[requestTimestamps.length - 1];
   const timeSinceLastRequest = Date.now() - lastTimestamp;
-  const waitTime = CONFIG.MIN_DELAY_BETWEEN_REQUESTS - timeSinceLastRequest;
-  
-  return Math.max(0, waitTime);
+  return Math.max(0, CONFIG.MIN_DELAY_MS - timeSinceLastRequest);
 }
 
 /**
- * Waits for the calculated delay before allowing the next request
+ * Waits for rate limit with TIMEOUT.
+ * ALWAYS returns or throws. NEVER hangs.
  */
-export async function waitForRateLimit(): Promise<void> {
-  const waitTimeMs = getWaitTimeMs();
+export async function waitForRateLimit(): Promise<RateLimitResult> {
+  const waitTimeMs = Math.min(calculateWaitTime(), CONFIG.MAX_WAIT_MS);
   
-  if (waitTimeMs > 0) {
-    const waitTimeSec = Math.ceil(waitTimeMs / 1000);
-    reportStatus(`Rate limit: waiting ${waitTimeSec}s before next request...`, waitTimeSec);
-    await new Promise(resolve => setTimeout(resolve, waitTimeMs));
-    // Clear the backoff after we've waited (so we don't wait twice)
-    currentBackoffMs = 0;
+  if (waitTimeMs <= 0) {
+    return { shouldProceed: true, waitedMs: 0 };
   }
+  
+  const waitTimeSec = Math.ceil(waitTimeMs / 1000);
+  reportStatus(`Waiting ${waitTimeSec}s for rate limit...`, waitTimeSec);
+  
+  await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+  
+  return { 
+    shouldProceed: true, 
+    waitedMs: waitTimeMs,
+    reason: `Waited ${waitTimeMs}ms for rate limit`
+  };
 }
 
 /**
- * Records a successful request timestamp
+ * Records a successful request timestamp.
  */
 export function recordRequest(): void {
   requestTimestamps.push(Date.now());
-  // Reset backoff on successful request
-  currentBackoffMs = 0;
-  consecutiveErrors = 0;
 }
 
 /**
- * Handles a 429 rate limit error by setting up exponential backoff
- * @param retryAfterSeconds - Optional retry-after value from the API response
+ * Calculates backoff for a SPECIFIC attempt number.
+ * PURE FUNCTION - no global state.
  */
-export function handle429Error(retryAfterSeconds?: number): void {
-  consecutiveErrors++;
-  
-  // Use retry-after header if provided, otherwise use exponential backoff
+export function calculateBackoff(attemptNumber: number, retryAfterSeconds?: number): number {
   if (retryAfterSeconds && retryAfterSeconds > 0) {
-    currentBackoffMs = (retryAfterSeconds + 5) * 1000; // Add 5s buffer
-    reportStatus(`API rate limit hit. Waiting ${retryAfterSeconds + 5}s as requested by API...`);
-  } else {
-    // Exponential backoff: 5s, 10s, 20s, 40s... up to max
-    currentBackoffMs = Math.min(
-      CONFIG.INITIAL_BACKOFF_MS * Math.pow(2, consecutiveErrors - 1),
-      CONFIG.MAX_BACKOFF_MS
-    );
-    reportStatus(`API rate limit hit. Backing off for ${Math.ceil(currentBackoffMs / 1000)}s...`);
+    return Math.min((retryAfterSeconds + 1) * 1000, CONFIG.MAX_BACKOFF_MS);
   }
+  
+  // Exponential backoff: 2s, 4s, 8s... capped at MAX_BACKOFF_MS
+  const backoff = CONFIG.INITIAL_BACKOFF_MS * Math.pow(2, attemptNumber - 1);
+  return Math.min(backoff, CONFIG.MAX_BACKOFF_MS);
 }
 
 /**
- * Checks if we should retry after a 429 error
- * @returns true if we should retry
+ * Waits for backoff with TIMEOUT.
  */
-export function shouldRetry(): boolean {
-  return consecutiveErrors <= CONFIG.MAX_RETRIES;
+export async function waitForBackoff(attemptNumber: number, retryAfterSeconds?: number): Promise<number> {
+  const backoffMs = calculateBackoff(attemptNumber, retryAfterSeconds);
+  const cappedBackoff = Math.min(backoffMs, CONFIG.MAX_WAIT_MS);
+  
+  if (cappedBackoff > 0) {
+    reportStatus(`Backing off ${Math.ceil(cappedBackoff / 1000)}s before retry...`);
+    await new Promise(resolve => setTimeout(resolve, cappedBackoff));
+  }
+  
+  return cappedBackoff;
 }
 
-/**
- * Resets the rate limiter state (useful for testing or user reset)
- */
+// ============================================================================
+// RESET
+// ============================================================================
+
 export function resetRateLimiter(): void {
   requestTimestamps = [];
-  currentBackoffMs = 0;
-  consecutiveErrors = 0;
-  reportStatus('Rate limiter reset');
+  requestLog = [];
+  requestIdCounter = 0;
+  notifyLogUpdate();
+  console.log('[RateLimiter] rateLimiter.ts: Reset complete');
 }
 
-/**
- * Gets the current rate limiter statistics
- * @returns Object with rate limiter stats
- */
+// ============================================================================
+// STATS
+// ============================================================================
+
 export function getRateLimiterStats(): {
   requestsInLastMinute: number;
   maxRequestsPerMinute: number;
   waitTimeMs: number;
-  consecutiveErrors: number;
   totalRequests: number;
   successfulRequests: number;
   failedRequests: number;
@@ -291,27 +261,23 @@ export function getRateLimiterStats(): {
   return {
     requestsInLastMinute: getRequestsInLastMinute(),
     maxRequestsPerMinute: CONFIG.MAX_REQUESTS_PER_MINUTE,
-    waitTimeMs: getWaitTimeMs(),
-    consecutiveErrors,
+    waitTimeMs: calculateWaitTime(),
     totalRequests: requestLog.length,
     successfulRequests: successful,
     failedRequests: failed,
   };
 }
 
-/**
- * Parses retry delay from Gemini API error message
- * @param errorMessage - The error message from the API
- * @returns Retry delay in seconds, or undefined if not found
- */
+// ============================================================================
+// ERROR PARSING UTILITIES
+// ============================================================================
+
 export function parseRetryDelay(errorMessage: string): number | undefined {
-  // Look for "Please retry in X.XXs" or similar patterns
   const retryMatch = errorMessage.match(/retry in (\d+(?:\.\d+)?)\s*s/i);
   if (retryMatch) {
     return Math.ceil(parseFloat(retryMatch[1]));
   }
   
-  // Look for retryDelay in JSON
   const jsonMatch = errorMessage.match(/"retryDelay"\s*:\s*"(\d+)s"/);
   if (jsonMatch) {
     return parseInt(jsonMatch[1], 10);
@@ -320,34 +286,35 @@ export function parseRetryDelay(errorMessage: string): number | undefined {
   return undefined;
 }
 
-/**
- * Checks if the error indicates daily quota exhaustion (not just per-minute rate limit)
- * @param errorMessage - The error message from the API
- * @returns true if daily quota is exhausted
- */
 export function isDailyQuotaExhausted(errorMessage: string): boolean {
-  // "limit: 0" appears in BOTH per-minute AND daily quota errors, so it's NOT reliable
-  // We need to check if the retry delay is very long (> 1 hour = likely daily limit)
-  // Or if the message explicitly says daily/day limit is exhausted
-  
-  // Check for explicit daily exhaustion messages
   const lowerMsg = errorMessage.toLowerCase();
-  if (lowerMsg.includes('daily limit') && lowerMsg.includes('exhausted')) {
-    return true;
-  }
-  if (lowerMsg.includes('daily quota') && lowerMsg.includes('exhausted')) {
+  
+  if (lowerMsg.includes('daily') && lowerMsg.includes('exhausted')) {
     return true;
   }
   
-  // Check if retry delay is > 1 hour (3600 seconds) - indicates daily limit
   const retryMatch = errorMessage.match(/retry in (\d+(?:\.\d+)?)\s*s/i);
   if (retryMatch) {
     const retrySeconds = parseFloat(retryMatch[1]);
     if (retrySeconds > 3600) {
-      return true; // Retry delay > 1 hour = daily quota exhausted
+      return true;
     }
   }
   
-  // For everything else, assume it's a per-minute rate limit (can be retried)
   return false;
 }
+
+export function is429Error(errorMessage: string): boolean {
+  return (
+    errorMessage.includes('429') ||
+    errorMessage.includes('Too Many Requests') ||
+    errorMessage.includes('quota') ||
+    errorMessage.includes('rate')
+  );
+}
+
+// ============================================================================
+// CONFIG EXPORT
+// ============================================================================
+
+export const RATE_LIMIT_CONFIG = { ...CONFIG } as const;

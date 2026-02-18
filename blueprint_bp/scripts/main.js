@@ -1,18 +1,28 @@
 // ============================================================================
-// SIMPLE BLUEPRINT - Optimized Version with Import Support
+// BLUEPRINT PRO - Advanced Blueprint System with Real-Time Desktop Sync
 // ============================================================================
 //
 // HOW TO USE:
-// 1. Convert .mcstructure files using: python converter/convert_structure.py
-// 2. Paste the JSON into scripts/blueprints.js
-// 3. In-game, use commands:
+// 1. Start the desktop viewer app (npm run start in viewer folder)
+// 2. Load blueprints from the desktop app - they sync automatically!
+// 3. Or use legacy mode with static blueprints from blueprints.js
+//
+// IN-GAME COMMANDS:
 //    - /scriptevent blueprint:list         - Show available blueprints
 //    - /scriptevent blueprint:load <name>  - Load a blueprint at your position
 //    - /scriptevent blueprint:clear        - Clear current blueprint
 //    - /scriptevent blueprint:hide         - Hide particles temporarily
 //    - /scriptevent blueprint:show         - Show particles again
+//    - /scriptevent blueprint:move         - Move blueprint to current position
+//    - /scriptevent blueprint:sync         - Manual sync with desktop app
+//    - /scriptevent blueprint:status       - Show connection status
+//    - /scriptevent blueprint:layer on     - Enable layer mode
+//    - /scriptevent blueprint:layer off    - Disable layer mode
+//    - /scriptevent blueprint:layer up     - Go up one layer
+//    - /scriptevent blueprint:layer down   - Go down one layer
+//    - /scriptevent blueprint:layer <num>  - Go to specific layer
 //
-// OR use the wand (wooden sword):
+// WAND CONTROLS (wooden sword):
 //    - Left-click: Set corner 1 (for saving)
 //    - Right-click: Set corner 2 (for saving)
 //    - Sneak + Right-click: Save selection to memory
@@ -22,6 +32,7 @@
 
 import { world, system, Player } from "@minecraft/server";
 import { BLUEPRINTS } from "./blueprints.js";
+import * as wsClient from "./wsClient.js";
 
 // ============================================================================
 // CONFIGURATION
@@ -39,9 +50,25 @@ const CONFIG = {
     renderDistance: 32,           // Only show particles within this distance
     chunkUpdateInterval: 20,      // How often to recalculate visible chunks
 
-    // Particle appearance
+    // Particle appearance - context-aware particles
+    particles: {
+        guide: "minecraft:endrod",              // White - guide particle for empty spots
+        missingEasy: "minecraft:villager_happy", // Green - block available nearby/inventory
+        missingHard: "minecraft:basic_flame_particle", // Orange - need to find/craft
+        wrongBlock: "minecraft:critical_hit",   // Red - wrong block placed
+        layerGuide: "minecraft:falling_dust",   // Gray - shows other layers dimly
+    },
+    
+    // Legacy particle names (for backwards compatibility)
     particleType: "minecraft:endrod",
-    particleMissing: "minecraft:basic_flame_particle",  // Different particle for missing blocks
+    particleMissing: "minecraft:basic_flame_particle",
+    
+    // Desktop sync settings
+    sync: {
+        enabled: true,              // Enable desktop app sync
+        serverUrl: "http://localhost:3001",
+        autoConnect: true,          // Auto-connect on world load
+    },
 };
 
 // ============================================================================
@@ -59,6 +86,20 @@ const decompressedCache = new Map();
 
 // Particle rendering state (for frame spreading)
 const renderState = new Map();
+
+// Synced blueprint from desktop app (shared across all players)
+let syncedBlueprint = null;
+
+// Layer mode state
+const layerMode = {
+    enabled: false,
+    currentY: 0,
+    maxY: 0,
+    showBelow: true,  // Show layers below current (dimmed)
+};
+
+// Connection status
+let isDesktopConnected = false;
 
 // ============================================================================
 // DECOMPRESSION - Expand run-length encoded data
@@ -213,6 +254,7 @@ function listBlueprints(player) {
 /**
  * Render particles for all active blueprints
  * Uses frame spreading to prevent lag spikes
+ * Supports layer mode for building layer-by-layer
  */
 function renderParticles() {
     const renderDistSq = CONFIG.renderDistance * CONFIG.renderDistance;
@@ -247,6 +289,18 @@ function renderParticles() {
             const idx = (startIndex + i) % blocks.length;
             const block = blocks[idx];
 
+            // Layer mode filtering
+            if (layerMode.enabled) {
+                // Only show blocks at or below current layer
+                if (block.y > layerMode.currentY) {
+                    continue;
+                }
+                // Skip blocks well below current layer unless showBelow is true
+                if (!layerMode.showBelow && block.y < layerMode.currentY) {
+                    continue;
+                }
+            }
+
             // Calculate world position
             const worldX = anchor.x + block.x;
             const worldY = anchor.y + block.y;
@@ -268,10 +322,23 @@ function renderParticles() {
                         continue;
                     }
 
-                    // Spawn particle
-                    const particleType = existingBlock.typeId === "minecraft:air"
-                        ? CONFIG.particleType           // Empty spot - normal particle
-                        : CONFIG.particleMissing;       // Wrong block - different particle
+                    // Determine particle type based on context
+                    let particleType;
+                    
+                    if (layerMode.enabled && block.y < layerMode.currentY) {
+                        // Lower layer - show dimmed/different particle
+                        particleType = CONFIG.particles.layerGuide;
+                    } else if (existingBlock.typeId === "minecraft:air") {
+                        // Empty spot - check if it's the current layer
+                        if (layerMode.enabled && block.y === layerMode.currentY) {
+                            particleType = CONFIG.particles.missingEasy; // Green for current layer
+                        } else {
+                            particleType = CONFIG.particles.guide; // White for general guide
+                        }
+                    } else {
+                        // Wrong block placed
+                        particleType = CONFIG.particles.wrongBlock;
+                    }
 
                     dimension.spawnParticle(particleType, worldPos);
                     particlesThisTick++;
@@ -418,8 +485,119 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
                 sendMessage(player, `§aMoved to ${data.anchor.x}, ${data.anchor.y}, ${data.anchor.z}`);
             }
             break;
+            
+        // ========== NEW SYNC COMMANDS ==========
+        case 'sync':
+            // Manual sync trigger
+            sendMessage(player, "§7Syncing with desktop app...");
+            if (wsClient.isConnected()) {
+                sendMessage(player, "§aAlready connected to desktop!");
+            } else {
+                wsClient.startClient({
+                    playerName: player.name,
+                    dimension: player.dimension.id,
+                });
+                sendMessage(player, "§eAttempting to connect...");
+            }
+            break;
+            
+        case 'status':
+            // Show connection status
+            const debugState = wsClient.getDebugState();
+            sendMessage(player, "§a--- Blueprint Pro Status ---");
+            sendMessage(player, `§7Desktop: ${debugState.connected ? "§aConnected" : "§cDisconnected"}`);
+            if (debugState.activeBlueprint) {
+                sendMessage(player, `§7Blueprint: §f${debugState.activeBlueprint.name}`);
+                sendMessage(player, `§7Blocks: §f${debugState.activeBlueprint.blockCount}`);
+            }
+            if (layerMode.enabled) {
+                sendMessage(player, `§7Layer Mode: §aON §7(Y=${layerMode.currentY})`);
+            }
+            sendMessage(player, `§7Progress: §f${debugState.progress.placedBlocks}/${debugState.progress.totalBlocks}`);
+            break;
+            
+        // ========== LAYER MODE COMMANDS ==========
+        case 'layer':
+            handleLayerCommand(player, event.message.trim());
+            break;
     }
 });
+
+/**
+ * Handles layer mode subcommands
+ * @param {Player} player 
+ * @param {string} args - Command arguments
+ */
+function handleLayerCommand(player, args) {
+    const parts = args.toLowerCase().split(/\s+/);
+    const subCommand = parts[0] || 'toggle';
+    
+    // Get the active blueprint to determine max Y
+    const bp = activeBlueprints.get(player.name) || syncedBlueprint;
+    if (!bp && subCommand !== 'off') {
+        sendMessage(player, "§cNo blueprint loaded!");
+        return;
+    }
+    
+    const maxY = bp ? (bp.size?.y || Math.max(...bp.blocks.map(b => b.y)) + 1) : 0;
+    layerMode.maxY = maxY;
+    
+    switch (subCommand) {
+        case 'on':
+            layerMode.enabled = true;
+            layerMode.currentY = 0;
+            sendMessage(player, `§aLayer mode ON - Layer Y=${layerMode.currentY} (max ${maxY - 1})`);
+            wsClient.toggleLayerMode();
+            break;
+            
+        case 'off':
+            layerMode.enabled = false;
+            sendMessage(player, "§7Layer mode OFF - Showing all blocks");
+            wsClient.toggleLayerMode();
+            break;
+            
+        case 'up':
+            if (!layerMode.enabled) {
+                layerMode.enabled = true;
+                layerMode.currentY = 0;
+            }
+            layerMode.currentY = Math.min(layerMode.currentY + 1, maxY - 1);
+            sendMessage(player, `§aLayer Y=${layerMode.currentY}`);
+            wsClient.requestLayerChange(layerMode.currentY);
+            break;
+            
+        case 'down':
+            if (!layerMode.enabled) {
+                layerMode.enabled = true;
+                layerMode.currentY = maxY - 1;
+            }
+            layerMode.currentY = Math.max(layerMode.currentY - 1, 0);
+            sendMessage(player, `§aLayer Y=${layerMode.currentY}`);
+            wsClient.requestLayerChange(layerMode.currentY);
+            break;
+            
+        case 'toggle':
+            layerMode.enabled = !layerMode.enabled;
+            sendMessage(player, layerMode.enabled 
+                ? `§aLayer mode ON - Layer Y=${layerMode.currentY}` 
+                : "§7Layer mode OFF");
+            wsClient.toggleLayerMode();
+            break;
+            
+        default:
+            // Try to parse as a number
+            const layerNum = parseInt(subCommand, 10);
+            if (!isNaN(layerNum)) {
+                layerMode.enabled = true;
+                layerMode.currentY = Math.max(0, Math.min(layerNum, maxY - 1));
+                sendMessage(player, `§aLayer Y=${layerMode.currentY}`);
+                wsClient.requestLayerChange(layerMode.currentY);
+            } else {
+                sendMessage(player, "§cUsage: /scriptevent blueprint:layer <on|off|up|down|NUMBER>");
+            }
+            break;
+    }
+}
 
 // Wand left-click (set corner 1)
 world.beforeEvents.playerBreakBlock.subscribe((event) => {
@@ -481,20 +659,176 @@ system.runInterval(() => {
 }, CONFIG.particleInterval);
 
 // ============================================================================
+// WEBSOCKET EVENT HANDLERS
+// ============================================================================
+
+// Handle desktop connection established
+wsClient.onConnect((data) => {
+    isDesktopConnected = true;
+    console.warn(`[Blueprint] main.js: Connected to desktop at ${data.serverUrl}`);
+    
+    // Notify all players
+    for (const player of world.getAllPlayers()) {
+        sendMessage(player, "§a[Blueprint Pro] Connected to desktop app!");
+    }
+});
+
+// Handle desktop disconnection
+wsClient.onDisconnect((data) => {
+    isDesktopConnected = false;
+    console.warn(`[Blueprint] main.js: Disconnected from desktop: ${data.reason}`);
+    
+    // Notify all players
+    for (const player of world.getAllPlayers()) {
+        sendMessage(player, "§c[Blueprint Pro] Desktop connection lost");
+    }
+});
+
+// Handle blueprint loaded from desktop
+wsClient.onBlueprintLoad((blueprint) => {
+    console.warn(`[Blueprint] main.js: Blueprint received from desktop: ${blueprint.name}`);
+    
+    // Store as synced blueprint (available to all players)
+    syncedBlueprint = {
+        name: blueprint.name,
+        blocks: [],  // Will be populated by chunks
+        size: blueprint.size,
+        visible: true,
+    };
+    
+    // Notify all players
+    for (const player of world.getAllPlayers()) {
+        sendMessage(player, `§a[Desktop Sync] Blueprint loaded: §f${blueprint.name}`);
+        sendMessage(player, `§7${blueprint.blockCount} blocks - Use wooden sword to move`);
+        
+        // Auto-load for the player at their position
+        if (!activeBlueprints.has(player.name)) {
+            activeBlueprints.set(player.name, {
+                name: blueprint.name,
+                blocks: syncedBlueprint.blocks,
+                anchor: {
+                    x: Math.floor(player.location.x),
+                    y: Math.floor(player.location.y),
+                    z: Math.floor(player.location.z)
+                },
+                visible: true,
+                dimension: player.dimension.id,
+                synced: true,  // Mark as synced from desktop
+            });
+            renderState.set(player.name, { index: 0 });
+        }
+    }
+});
+
+// Handle blueprint cleared from desktop
+wsClient.onBlueprintClear(() => {
+    console.warn("[Blueprint] main.js: Blueprint cleared by desktop");
+    syncedBlueprint = null;
+    
+    // Clear synced blueprints for all players
+    for (const [playerName, data] of activeBlueprints) {
+        if (data.synced) {
+            activeBlueprints.delete(playerName);
+            renderState.delete(playerName);
+        }
+    }
+    
+    // Notify players
+    for (const player of world.getAllPlayers()) {
+        sendMessage(player, "§7[Desktop Sync] Blueprint cleared");
+    }
+});
+
+// Handle layer mode update from desktop
+wsClient.onLayerUpdate((layerData) => {
+    layerMode.enabled = layerData.enabled;
+    layerMode.currentY = layerData.currentY;
+    layerMode.showBelow = layerData.showBelow;
+    
+    console.warn(`[Blueprint] main.js: Layer mode updated: Y=${layerData.currentY}, enabled=${layerData.enabled}`);
+});
+
+// Handle progress updates from desktop
+wsClient.onProgressUpdate((progress) => {
+    // Could display progress bar or notifications
+    // For now, just log
+    console.warn(`[Blueprint] main.js: Progress: ${progress.placedBlocks}/${progress.totalBlocks}`);
+});
+
+// Handle errors from WebSocket client
+wsClient.onError((error) => {
+    console.error(`[Blueprint] main.js: Sync error: ${error.message}`);
+    
+    // Only notify players for significant errors
+    if (error.type === 'connection') {
+        for (const player of world.getAllPlayers()) {
+            sendMessage(player, `§c[Blueprint Pro] ${error.message}`);
+        }
+    }
+});
+
+// ============================================================================
 // STARTUP
 // ============================================================================
 
 world.afterEvents.worldInitialize.subscribe(() => {
     const blueprintCount = Object.keys(BLUEPRINTS).length;
-    console.warn(`[Blueprint] Loaded with ${blueprintCount} blueprints`);
+    console.warn(`[Blueprint] main.js: Loaded with ${blueprintCount} static blueprints`);
+    
+    // Start WebSocket client if enabled
+    if (CONFIG.sync.enabled && CONFIG.sync.autoConnect) {
+        console.warn("[Blueprint] main.js: Starting desktop sync client...");
+        system.runTimeout(() => {
+            wsClient.startClient({
+                serverUrl: CONFIG.sync.serverUrl,
+            });
+        }, 40); // Wait 2 seconds after world init
+    }
 });
 
 world.afterEvents.playerSpawn.subscribe((event) => {
     if (event.initialSpawn) {
         system.runTimeout(() => {
-            sendMessage(event.player, "§a--- Simple Blueprint ---");
+            sendMessage(event.player, "§a--- Blueprint Pro ---");
             sendMessage(event.player, "§7Commands: /scriptevent blueprint:list");
+            sendMessage(event.player, "§7Desktop sync: /scriptevent blueprint:status");
+            sendMessage(event.player, "§7Layer mode: /scriptevent blueprint:layer");
             sendMessage(event.player, "§7Or use wooden sword as wand");
+            
+            // Update wsClient with player info
+            wsClient.startClient({
+                playerName: event.player.name,
+                dimension: event.player.dimension.id,
+            });
         }, 60);
+    }
+});
+
+// Track block placement for progress updates
+world.afterEvents.playerPlaceBlock.subscribe((event) => {
+    const block = event.block;
+    const bp = activeBlueprints.get(event.player.name);
+    
+    if (bp && bp.synced && isDesktopConnected) {
+        // Calculate relative position
+        const relX = block.location.x - bp.anchor.x;
+        const relY = block.location.y - bp.anchor.y;
+        const relZ = block.location.z - bp.anchor.z;
+        
+        // Send to desktop
+        wsClient.sendBlockPlaced(relX, relY, relZ, block.typeId);
+    }
+});
+
+// Track block breaking for progress updates
+world.afterEvents.playerBreakBlock.subscribe((event) => {
+    const bp = activeBlueprints.get(event.player.name);
+    
+    if (bp && bp.synced && isDesktopConnected) {
+        const relX = event.block.location.x - bp.anchor.x;
+        const relY = event.block.location.y - bp.anchor.y;
+        const relZ = event.block.location.z - bp.anchor.z;
+        
+        wsClient.sendBlockBroken(relX, relY, relZ);
     }
 });

@@ -1,9 +1,12 @@
-import { useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Scene } from './components/VoxelViewer/Scene';
 import { VideoAnalyzer } from './components/VideoAnalyzer';
 import { MaterialsList } from './components/MaterialsList';
 import { ExportButton } from './components/ExportButton';
+import { GameConnection } from './components/GameConnection';
+import { ProjectHistory } from './components/ProjectHistory';
 import { useBlueprintStore } from './store/blueprintStore';
+import { useProjectHistoryStore } from './store/projectHistoryStore';
 import type { Block, Size3D } from './types';
 
 // NBT Reader for drag-drop file support
@@ -102,6 +105,8 @@ function parseJSONBlueprint(data: { name?: string; size?: { x: number; y: number
 
 function App() {
   const { setBlocks, blocks, name, size, clearBlocks } = useBlueprintStore();
+  const { saveProject, projects } = useProjectHistoryStore();
+  const [showProjectHistory, setShowProjectHistory] = useState(false);
 
   const processFile = useCallback(async (file: File) => {
     try {
@@ -110,17 +115,42 @@ function App() {
         const reader = new NBTReader(buffer);
         const nbt = reader.parse();
         const result = parseStructure(nbt);
-        if (result.blocks.length > 0) setBlocks(result.blocks, result.size, file.name.replace('.mcstructure', ''));
+        if (result.blocks.length > 0) {
+          const projectName = file.name.replace('.mcstructure', '');
+          setBlocks(result.blocks, result.size, projectName);
+          
+          // Save to project history
+          saveProject({
+            name: projectName,
+            source: 'file',
+            sourceDetails: file.name,
+            blockCount: result.blocks.length,
+            size: result.size,
+            blocks: result.blocks,
+          });
+        }
       } else if (file.name.endsWith('.json')) {
         const text = await file.text();
         const data = JSON.parse(text);
         const result = parseJSONBlueprint(data);
-        if (result.blocks.length > 0) setBlocks(result.blocks, result.size, result.name);
+        if (result.blocks.length > 0) {
+          setBlocks(result.blocks, result.size, result.name);
+          
+          // Save to project history
+          saveProject({
+            name: result.name,
+            source: 'file',
+            sourceDetails: file.name,
+            blockCount: result.blocks.length,
+            size: result.size,
+            blocks: result.blocks,
+          });
+        }
       }
     } catch (err) {
       console.error('Failed to parse file:', err);
     }
-  }, [setBlocks]);
+  }, [setBlocks, saveProject]);
 
   // Global drag-drop handler
   useEffect(() => {
@@ -168,6 +198,27 @@ function App() {
 
       <MaterialsList />
       <ExportButton />
+      <GameConnection />
+
+      {/* Saved Projects Button - Always visible */}
+      <button
+        onClick={() => setShowProjectHistory(true)}
+        className="absolute bottom-4 left-4 z-20 bg-slate-800/90 backdrop-blur hover:bg-slate-700 text-white rounded-xl px-4 py-3 shadow-xl transition-colors flex items-center gap-3"
+      >
+        <span className="text-xl">📚</span>
+        <div className="text-left">
+          <span className="font-medium">Saved Projects</span>
+          {projects.length > 0 && (
+            <span className="text-xs text-gray-400 ml-2">({projects.length})</span>
+          )}
+        </div>
+      </button>
+
+      {/* Project History Modal */}
+      <ProjectHistory 
+        isOpen={showProjectHistory} 
+        onClose={() => setShowProjectHistory(false)} 
+      />
 
       {/* Drop hint overlay */}
       {!hasBlocks && (
