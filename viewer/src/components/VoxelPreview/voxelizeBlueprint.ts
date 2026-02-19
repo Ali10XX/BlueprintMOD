@@ -116,25 +116,50 @@ export function validateBlueprint(blueprint: SliceBlueprint): ValidationResult {
 /**
  * Converts a single slice to voxel instances.
  * Grid rows = Z axis, columns = X axis.
- * 
+ *
+ * If the slice has `extras`, those positions override the default block type
+ * (and carry optional blockState metadata for downstream export).
+ * The voxel renderer treats all blocks as full cubes regardless of blockState.
+ *
  * @param slice - The slice to convert
  * @returns Array of voxel instances for this slice
  */
 function sliceToVoxels(slice: BlueprintSlice): VoxelInstance[] {
   const voxels: VoxelInstance[] = [];
 
+  // Index extras by "x,z" for O(1) override lookup.
+  // extras REPLACE the default block at that position, not supplement it.
+  const extrasByPos = new Map<string, { blockType: string; blockState?: import('./blueprintTypes').BlockState }>();
+  if (slice.extras) {
+    for (const extra of slice.extras) {
+      extrasByPos.set(`${extra.x},${extra.z}`, extra);
+    }
+  }
+
+  // Process the ASCII grid. Skip positions covered by an extra (extra takes priority).
   slice.grid.forEach((row, z) => {
     for (let x = 0; x < row.length; x++) {
       if (row[x] === '#') {
-        voxels.push({
-          x,
-          y: slice.y,
-          z,
-          blockType: slice.block || 'unknown',
-        });
+        const key = `${x},${z}`;
+        if (!extrasByPos.has(key)) {
+          voxels.push({ x, y: slice.y, z, blockType: slice.block || 'unknown' });
+        }
       }
     }
   });
+
+  // Emit extras as voxels. Each carries its specific blockType + blockState.
+  if (slice.extras) {
+    for (const extra of slice.extras) {
+      voxels.push({
+        x: extra.x,
+        y: slice.y,
+        z: extra.z,
+        blockType: extra.blockType,
+        blockState: extra.blockState,
+      });
+    }
+  }
 
   return voxels;
 }
@@ -147,13 +172,18 @@ function sliceToVoxels(slice: BlueprintSlice): VoxelInstance[] {
  * @returns VoxelizeResult containing all voxels and metadata
  */
 export function voxelizeBlueprint(blueprint: SliceBlueprint): VoxelizeResult {
-  // Convert all slices to voxels
-  const allVoxels: VoxelInstance[] = [];
+  // Convert all slices to voxels.
+  // Use a positional Map so later slices (e.g. rim overlays) override earlier ones
+  // at the same (x,y,z), eliminating coplanar Z-fighting from overlapping geometry.
+  const posMap = new Map<string, VoxelInstance>();
 
   for (const slice of blueprint.slices) {
-    const sliceVoxels = sliceToVoxels(slice);
-    allVoxels.push(...sliceVoxels);
+    for (const v of sliceToVoxels(slice)) {
+      posMap.set(`${v.x},${v.y},${v.z}`, v);
+    }
   }
+
+  const allVoxels = Array.from(posMap.values());
 
   // Calculate bounds
   let minX = Infinity, maxX = -Infinity;

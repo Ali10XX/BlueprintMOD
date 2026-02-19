@@ -5,17 +5,62 @@
  * This format represents structures layer-by-layer using ASCII grid patterns.
  */
 
+/**
+ * Minecraft block state properties.
+ * All fields are optional; only include what differs from the block's default.
+ * Preserved verbatim for export to .mcstructure / .schem — not used by the
+ * voxel renderer (which treats every block as a full cube).
+ *
+ * Examples:
+ *   cyan_concrete_stairs  →  { facing: 'north', half: 'bottom', shape: 'straight' }
+ *   cyan_concrete_slab    →  { type: 'bottom' }
+ *   smooth_quartz_slab    →  { type: 'top' }
+ */
+export interface BlockState {
+  /** Cardinal direction the block "faces" (stairs: direction of ascent) */
+  facing?: 'north' | 'south' | 'east' | 'west' | 'up' | 'down';
+  /** Whether the stair/slab occupies the top or bottom half of the block space */
+  half?: 'top' | 'bottom';
+  /** Stair corner shape */
+  shape?: 'straight' | 'inner_left' | 'inner_right' | 'outer_left' | 'outer_right';
+  /** Slab position: 'top', 'bottom', or 'double' (full block) */
+  type?: 'top' | 'bottom' | 'double';
+}
+
+/**
+ * A per-cell block override within a slice.
+ * Overrides the base `block` type for the cell at (x, z) with a richer block
+ * (e.g. a stair or slab) and optional block state metadata.
+ * The ASCII grid still marks this cell '#' — the override is applied by the
+ * voxelizer at export time, not during preview rendering.
+ */
+export interface SliceExtra {
+  x: number;
+  z: number;
+  /** Block type for this cell, e.g. "cyan_concrete_stairs" */
+  blockType: string;
+  /** Optional Minecraft block state properties */
+  blockState?: BlockState;
+}
+
 /** Represents a single horizontal slice at a given Y level */
 export interface BlueprintSlice {
   /** The Y coordinate (height) of this slice */
   y: number;
-  /** The block type to use for this slice (e.g., "smooth_quartz") */
+  /** The default block type for '#' cells in this slice (e.g., "smooth_quartz") */
   block: string;
-  /** 
+  /**
    * ASCII grid where '#' = block, '.' = air
    * Rows represent Z axis, columns represent X axis
    */
   grid: string[];
+  /**
+   * Per-cell block overrides. Each entry replaces the default `block` type
+   * at that (x, z) position with a specific block + optional block state.
+   * Used for stairs, slabs, and other sub-block detail.
+   * Absent = all '#' cells use the slice's `block` type.
+   */
+  extras?: SliceExtra[];
 }
 
 /** Recommended block palette for the structure */
@@ -45,12 +90,14 @@ export interface SliceBlueprint {
   slices: BlueprintSlice[];
 }
 
-/** A single voxel instance with position and block type */
+/** A single voxel instance with position, block type, and optional block state */
 export interface VoxelInstance {
   x: number;
   y: number;
   z: number;
   blockType: string;
+  /** Preserved from SliceExtra for downstream export; not used by the voxel renderer */
+  blockState?: BlockState;
 }
 
 /** Result of voxelizing a blueprint */

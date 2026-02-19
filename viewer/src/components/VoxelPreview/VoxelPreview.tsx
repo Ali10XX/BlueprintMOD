@@ -28,10 +28,20 @@ import {
  * Add new blocks here as needed.
  */
 const PREVIEW_BLOCK_COLORS: Record<string, string> = {
-  // Requested blocks
-  'warped_concrete': '#1a8a8a',       // Teal
-  'cyan_terracotta': '#4a8a8a',       // Blue-green
+  // Monument blocks (with minecraft: aliases)
+  'warped_concrete': '#1a9a9a',       // Teal (warped nether)
+  'minecraft:warped_concrete': '#1a9a9a',
+  'cyan_concrete': '#16a5a5',         // Cyan - MUST be cyan, not grey!
+  'minecraft:cyan_concrete': '#16a5a5',
+  'cyan_terracotta': '#4a8a8a',       // Blue-green terracotta
+  'minecraft:cyan_terracotta': '#4a8a8a',
   'smooth_quartz': '#f0f0f0',         // White
+  'minecraft:smooth_quartz': '#f0f0f0',
+  // Stair/slab variants — match parent block color for consistent preview rendering
+  'cyan_concrete_stairs': '#16a5a5',
+  'cyan_concrete_slab': '#16a5a5',
+  'smooth_quartz_stairs': '#f0f0f0',
+  'smooth_quartz_slab': '#f0f0f0',
   
   // Common blocks
   'stone': '#7d7d7d',
@@ -116,11 +126,20 @@ interface InstancedVoxelMeshProps {
   visibleMaxY: number;
   showBaseOnly: boolean;
   baseY: number;
+  /** Geometry dimensions in block-local units (default 0.98 each) */
+  geomW?: number;
+  geomH?: number;
+  geomD?: number;
+  /** Position offset in block-local units applied before world scale */
+  xOff?: number;
+  yOff?: number;
+  zOff?: number;
 }
 
 /**
  * Renders voxels of a single block type using InstancedMesh.
- * Highly efficient for large numbers of identical cubes.
+ * geomH/yOff drive slab half-height rendering.
+ * geomW/geomD/xOff/zOff drive stair upper-step rendering.
  */
 function InstancedVoxelMesh({
   voxels,
@@ -129,58 +148,100 @@ function InstancedVoxelMesh({
   visibleMaxY,
   showBaseOnly,
   baseY,
+  geomW = 0.98,
+  geomH = 0.98,
+  geomD = 0.98,
+  xOff = 0,
+  yOff = 0,
+  zOff = 0,
 }: InstancedVoxelMeshProps) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const tempMatrix = useMemo(() => new THREE.Matrix4(), []);
-  const tempPosition = useMemo(() => new THREE.Vector3(), []);
 
-  // Filter visible voxels based on Y constraints
   const visibleVoxels = useMemo(() => {
     return voxels.filter(v => {
-      if (showBaseOnly) {
-        return v.y === baseY;
-      }
+      if (showBaseOnly) return v.y === baseY;
       return v.y <= visibleMaxY;
     });
   }, [voxels, visibleMaxY, showBaseOnly, baseY]);
 
-  // Update instance matrices when visibility changes
   useEffect(() => {
     if (!meshRef.current) return;
 
-    // console.log(`VoxelPreview: Updating ${visibleVoxels.length} instances for ${blockType}`);
+    // compose(position, quaternion, scale) correctly separates T, R, S —
+    // avoids the old makeTranslation+.scale() bug where .scale() also rescaled
+    // the translation vector, causing wrong positions at scale ≠ 1.
+    const pos  = new THREE.Vector3();
+    const quat = new THREE.Quaternion(); // identity — no rotation needed
+    const scl  = new THREE.Vector3(scale, scale, scale);
 
     visibleVoxels.forEach((voxel, i) => {
-      tempPosition.set(
-        voxel.x * scale,
-        voxel.y * scale,
-        voxel.z * scale
+      pos.set(
+        voxel.x * scale + xOff * scale,
+        voxel.y * scale + yOff * scale,
+        voxel.z * scale + zOff * scale
       );
-      tempMatrix.makeTranslation(tempPosition.x, tempPosition.y, tempPosition.z);
-      tempMatrix.scale(new THREE.Vector3(scale, scale, scale));
+      tempMatrix.compose(pos, quat, scl);
       meshRef.current!.setMatrixAt(i, tempMatrix);
     });
 
     meshRef.current.instanceMatrix.needsUpdate = true;
     meshRef.current.count = visibleVoxels.length;
-  }, [visibleVoxels, scale, tempMatrix, tempPosition, blockType]);
+  }, [visibleVoxels, scale, xOff, yOff, zOff, tempMatrix, blockType]);
 
-  // Allocate mesh with max capacity
   const maxCount = voxels.length;
-
   if (maxCount === 0) return null;
-
   const color = getPreviewColor(blockType);
 
   return (
-    <instancedMesh
-      ref={meshRef}
-      args={[undefined, undefined, maxCount]}
-      frustumCulled={false}
-    >
-      <boxGeometry args={[0.98, 0.98, 0.98]} />
+    <instancedMesh ref={meshRef} args={[undefined, undefined, maxCount]} frustumCulled={false}>
+      <boxGeometry args={[geomW, geomH, geomD]} />
       <meshLambertMaterial color={color} />
     </instancedMesh>
+  );
+}
+
+/**
+ * Two-step stair approximation: a full-width lower step + a half-width upper step.
+ * Both steps are half-height (0.49 units). The upper step sits on the "full-block"
+ * side indicated by `facing` (same convention as Minecraft block states).
+ *
+ * facing = direction the FULL BLOCK portion points (outward from dome center).
+ *   east  → upper step on +x side
+ *   west  → upper step on -x side
+ *   south → upper step on +z side
+ *   north → upper step on -z side
+ */
+function StairInstancedMesh({
+  voxels,
+  blockType,
+  scale,
+  visibleMaxY,
+  showBaseOnly,
+  baseY,
+  facing,
+}: InstancedVoxelMeshProps & { facing: 'north' | 'south' | 'east' | 'west' }) {
+  const common = { voxels, blockType, scale, visibleMaxY, showBaseOnly, baseY };
+
+  const isEW = facing === 'east' || facing === 'west';
+  const upperGeomW = isEW ? 0.49 : 0.98;
+  const upperGeomD = isEW ? 0.98 : 0.49;
+  const upperXOff  = facing === 'east' ? 0.245 : facing === 'west'  ? -0.245 : 0;
+  const upperZOff  = facing === 'south' ? 0.245 : facing === 'north' ? -0.245 : 0;
+
+  return (
+    <>
+      {/* Lower step: full footprint, bottom half.
+          geomH=0.48 (not 0.49) + yOff=-0.25 → top face sits at y=-0.01, just below center.
+          This closes the coplanar seam with the upper step (whose bottom is at y=+0.01). */}
+      <InstancedVoxelMesh {...common} geomH={0.48} yOff={-0.25} />
+      {/* Upper step: half footprint on the facing side, top half.
+          yOff=+0.25 → bottom face at y=+0.01, just above the lower step top face. */}
+      <InstancedVoxelMesh {...common}
+        geomW={upperGeomW} geomH={0.48} geomD={upperGeomD}
+        xOff={upperXOff} yOff={0.25} zOff={upperZOff}
+      />
+    </>
   );
 }
 
@@ -214,9 +275,44 @@ function SceneContent({
     return voxelResult.voxels;
   }, [voxelResult, centered]);
 
-  // Group voxels by block type for instanced rendering
-  const voxelGroups = useMemo(() => {
-    return groupVoxelsByBlockType(voxels);
+  // Group voxels by (blockType + sub-variant) for shape-aware instanced rendering.
+  // Slabs split by top/bottom; stairs split by facing direction.
+  type RenderVariant = 'full' | 'slab-bottom' | 'slab-top' | 'stair';
+  type RenderGroup = {
+    voxels: VoxelInstance[];
+    blockType: string;
+    variant: RenderVariant;
+    facing?: 'north' | 'south' | 'east' | 'west';
+  };
+
+  const renderGroups = useMemo(() => {
+    const groups = new Map<string, RenderGroup>();
+    for (const v of voxels) {
+      const isSlab  = v.blockType.endsWith('_slab');
+      const isStair = v.blockType.endsWith('_stairs');
+
+      let key: string;
+      let variant: RenderVariant = 'full';
+      let facing: RenderGroup['facing'];
+
+      if (isSlab) {
+        const half = v.blockState?.type ?? 'bottom';
+        key = `${v.blockType}:${half}`;
+        variant = half === 'top' ? 'slab-top' : 'slab-bottom';
+      } else if (isStair) {
+        facing = (v.blockState?.facing as RenderGroup['facing']) ?? 'east';
+        key = `${v.blockType}:${facing}`;
+        variant = 'stair';
+      } else {
+        key = v.blockType;
+      }
+
+      if (!groups.has(key)) {
+        groups.set(key, { voxels: [], blockType: v.blockType, variant, facing });
+      }
+      groups.get(key)!.voxels.push(v);
+    }
+    return groups;
   }, [voxels]);
 
   // Calculate center point for camera target
@@ -268,18 +364,22 @@ function SceneContent({
         followCamera={false}
       />
 
-      {/* Render each block type as an instanced mesh */}
-      {Array.from(voxelGroups.entries()).map(([blockType, blockVoxels]) => (
-        <InstancedVoxelMesh
-          key={blockType}
-          voxels={blockVoxels}
-          blockType={blockType}
-          scale={scale}
-          visibleMaxY={visibleMaxY}
-          showBaseOnly={showBaseOnly}
-          baseY={baseY}
-        />
-      ))}
+      {/* Render each group — full blocks, slabs (half-height), or stairs (two-step) */}
+      {Array.from(renderGroups.entries()).map(([key, meta]) => {
+        const common = {
+          key,
+          voxels: meta.voxels,
+          blockType: meta.blockType,
+          scale,
+          visibleMaxY,
+          showBaseOnly,
+          baseY,
+        };
+        if (meta.variant === 'slab-bottom') return <InstancedVoxelMesh {...common} geomH={0.49} yOff={-0.245} />;
+        if (meta.variant === 'slab-top')    return <InstancedVoxelMesh {...common} geomH={0.49} yOff={0.245} />;
+        if (meta.variant === 'stair')       return <StairInstancedMesh  {...common} facing={meta.facing ?? 'east'} />;
+        return <InstancedVoxelMesh {...common} />;
+      })}
 
       {/* Subtle environment lighting */}
       <Environment preset="city" background={false} />

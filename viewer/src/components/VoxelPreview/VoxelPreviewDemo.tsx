@@ -1,106 +1,16 @@
 /**
  * VoxelPreviewDemo.tsx
  * 
- * Demo page showcasing the VoxelPreview component with a sample blueprint.
- * Features the Al-Shaheed (Martyr's) Monument reconstruction.
+ * Demo page showcasing the VoxelPreview component with a procedurally generated
+ * Al-Shaheed (Martyr's) Monument blueprint.
  */
 
 import { useState } from 'react';
 import { VoxelPreview } from './VoxelPreview';
-import type { SliceBlueprint } from './blueprintTypes';
+import { generateAlShaheedLikeBlueprint } from '../../tools/generateMonumentBlueprint';
 
-// ============================================================================
-// SAMPLE BLUEPRINT - Al-Shaheed Monument
-// ============================================================================
-
-/**
- * Sample blueprint: Al-Shaheed (Martyr's) Monument
- * Features two offset turquoise semi-domes on a circular platform.
- */
-const SAMPLE_BLUEPRINT: SliceBlueprint = {
-  description: "A Minecraft reconstruction of the Al-Shaheed (Martyr's) Monument, featuring two offset turquoise semi-domes (onion-shaped) situated on a circular platform with a central sculpture.",
-  recommended_block_palette: {
-    primary: "warped_concrete",
-    secondary: "cyan_terracotta",
-    base: "smooth_quartz"
-  },
-  dimensions_estimate: {
-    width: 45,
-    depth: 35,
-    height: 40
-  },
-  slices: [
-    {
-      y: 0,
-      block: "smooth_quartz",
-      grid: [
-        "......#########......",
-        "....#############....",
-        "..#################..",
-        ".###################.",
-        "#####################",
-        ".###################.",
-        "..#################..",
-        "....#############....",
-        "......#########......"
-      ]
-    },
-    {
-      y: 5,
-      block: "warped_concrete",
-      grid: [
-        "#######.......#######",
-        "#########...#########",
-        "#########...#########",
-        "#########...#########",
-        ".#######.....#######.",
-        "..#####.......#####.."
-      ]
-    },
-    {
-      y: 15,
-      block: "warped_concrete",
-      grid: [
-        "#########...#########",
-        "##########.##########",
-        "##########.##########",
-        "##########.##########",
-        ".########...########.",
-        "..######.....######.."
-      ]
-    },
-    {
-      y: 25,
-      block: "warped_concrete",
-      grid: [
-        "....#####...#####....",
-        "...#######.#######...",
-        "...#######.#######...",
-        "...#######.#######...",
-        "....#####...#####....",
-        ".....###.....###....."
-      ]
-    },
-    {
-      y: 35,
-      block: "warped_concrete",
-      grid: [
-        ".......##...##.......",
-        "......####.####......",
-        "......####.####......",
-        ".......##...##.......",
-        "........#...#........"
-      ]
-    },
-    {
-      y: 40,
-      block: "warped_concrete",
-      grid: [
-        "........#...#........"
-      ]
-    }
-  ]
-};
+// Generate blueprint once at module load (not on every render)
+const SAMPLE_BLUEPRINT = generateAlShaheedLikeBlueprint();
 
 // ============================================================================
 // DEMO COMPONENT
@@ -119,7 +29,7 @@ export function VoxelPreviewDemo() {
             VoxelPreview Demo
           </h1>
           <p className="text-sm text-gray-400">
-            Al-Shaheed Monument Blueprint
+            Procedural Al-Shaheed Monument • {SAMPLE_BLUEPRINT.slices.length} slices
           </p>
         </div>
 
@@ -170,7 +80,10 @@ export function VoxelPreviewDemo() {
           <div className="w-1/2 bg-slate-900 border-l border-slate-700 overflow-auto">
             <div className="p-4">
               <h3 className="text-lg font-bold text-cyan-400 mb-4">Blueprint JSON</h3>
-              <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap">
+              <p className="text-sm text-gray-400 mb-2">
+                Generated {SAMPLE_BLUEPRINT.slices.length} slices • {SAMPLE_BLUEPRINT.dimensions_estimate?.width}×{SAMPLE_BLUEPRINT.dimensions_estimate?.depth}×{SAMPLE_BLUEPRINT.dimensions_estimate?.height}
+              </p>
+              <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap max-h-[calc(100vh-200px)] overflow-auto">
                 {JSON.stringify(SAMPLE_BLUEPRINT, null, 2)}
               </pre>
             </div>
