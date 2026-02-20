@@ -3,18 +3,25 @@
  *
  * Procedural generator for Al-Shaheed (Martyr's) Monument in Baghdad, Iraq.
  *
- * Architectural accuracy based on real monument:
- * - TWO IDENTICAL half-domes (same size, same curvature)
- * - Positioned in "S" offset pattern (not centered/symmetric)
- * - Each shell is a true half-dome cut through its center
- * - Shells face each other but are offset in Z axis
- * - Circular platform base (190m diameter in real life)
- * - 40m tall turquoise dome in real monument
+ * HOLLOW CONTRACT (non-negotiable):
+ *   The interior of each dome shell is ALWAYS empty (zero voxels).
+ *   A voxel is placed only when its 2-D distance from the dome centre
+ *   falls inside the strict band:  r − thickness ≤ dist ≤ r + epsilon.
+ *   Nothing at dist < r − thickness is EVER placed.
+ *   A post-placement hollow-validation sweep enforces this invariant.
  *
- * Uses deterministic math - no AI, no network requests.
+ * Architecture:
+ *   TWO identical half-domes, S-offset, facing each other.
+ *   Cubic Bézier radial profile + peak sharpening (r × (1−t)^0.45).
+ *   4-zone curvature smoothing: full / slab / stair / full-steep.
+ *   Anti-teeth guard prevents vertical stair columns.
+ *   Base-gap stitch closes the 1-voxel void ring at the plinth junction.
+ *
+ * Uses deterministic math — no AI, no network requests.
  */
 
-/** Minecraft block state fields — same shape as the exported type in blueprintTypes.ts */
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 type BlockState = {
   facing?: 'north' | 'south' | 'east' | 'west' | 'up' | 'down';
   half?: 'top' | 'bottom';
@@ -22,7 +29,6 @@ type BlockState = {
   type?: 'top' | 'bottom' | 'double';
 };
 
-/** A per-cell block override attached to a slice */
 type SliceExtra = {
   x: number;
   z: number;
@@ -40,311 +46,200 @@ type Slice = {
 
 type Blueprint = {
   description: string;
-  recommended_block_palette: {
-    primary: string;
-    secondary?: string;
-    base: string;
-  };
+  recommended_block_palette: { primary: string; secondary?: string; base: string };
   dimensions_estimate: { width: number; depth: number; height: number };
   slices: Slice[];
 };
 
-// ============================================================================
-// CONFIGURABLE PARAMETERS - Tuned for Al-Shaheed Monument accuracy
-// ============================================================================
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  // Grid dimensions - wide platform, proportional to real monument (190m platform, 40m dome)
-  W: 90,                    // Grid width (X axis)
-  D: 90,                    // Grid depth (Z axis) - square platform like real monument
-  H: 31,                    // Total height (increased to preserve dome height after taller plinth)
-  baseThickness: 5,         // Total plinth height (sum of all plinth step layers)
+  // Grid (100×100 gives margin for scaled plinth ≈ 47-block radius from centre)
+  W: 100,
+  D: 100,
+  H: 65,             // nominal total height; effective H2 = round(H × heightScale) = 59
+  baseThickness: 5,  // plinth layers below dome
 
-  // IDENTICAL shell parameters (real monument has two equal halves)
-  shellRadius: 20,          // Both shells same radius
-  shellExponent: 0.35,      // Same curvature profile
+  // Reference shell radius (pre-scaling)
+  shellRadius: 20,   // R in blocks; effective R2 = R × radiusScale = 23.6
 
-  // Shell A position - offset for "S" shape in plan
-  cxA: 35,                  // X center - left side
-  czA: 52,                  // Z center - pushed toward back
+  // Aspect scaling
+  radiusScale: 1.18, // wider footprint
+  heightScale: 0.90, // shorter overall (H2 = round(65 × 0.90) = 59)
 
-  // Shell B position - offset opposite direction for "S" shape
-  cxB: 55,                  // X center - right side
-  czB: 38,                  // Z center - pushed toward front (14 blocks offset from A)
+  // Shell centres — ~0.85 R2 separation in X, with Z S-offset
+  // halfOverlap=8 means each shell extends 8 blocks past its cut plane,
+  // so Shell A (cx=42) reaches x=50 and Shell B (cx=58) reaches x=50:
+  // the two flat faces meet exactly at the grid centre, giving "slight intersection".
+  cxA: 42, czA: 56,  // Shell A: left-back
+  cxB: 58, czB: 44,  // Shell B: right-front  (12-block Z offset)
+  halfOverlap: 8,    // shells extend this many blocks past their cut plane
 
-  // Two-phase curvature control - onion/teardrop dome shape
-  slowPhaseEnd: 0.65,       // Radius shrinks slowly until 65% height
-  slowPhaseShrink: 0.12,    // Shrink 12% in slow phase
-  fastPhaseExponent: 2.8,   // Exponential taper for pointed top
+  // ── Cubic Bézier radial profile ─────────────────────────────────────────
+  // B(0)=0.82, B(0.6)≈1.05, B(1.0)=0.22  (fractions of R2).
+  // Approximately satisfies: r(0)=0.82R2, r(0.3)≈0.95R2, r(0.6)=1.05R2, r(1)=0.22R2.
+  bezierP0: 0.82,
+  bezierP1: 0.80,   // slightly below P0 → imperceptible sub-voxel initial dip
+  bezierP2: 1.67,   // high handle → B(0.6) ≈ 1.05 R2
+  bezierP3: 0.22,
 
-  // Radial profile: "in → out → in" scaling applied on top of alShaheedRadius().
-  // baseTuck    — how much the base is pulled inward (s(0) ≈ 1 - baseTuck)
-  // bulgeAmount — how far the mid-section bulges outward (s(bulgeCenter) ≈ 1 + bulgeAmount)
-  // bulgeCenter — t in [0,1] where the bulge peaks (0 = base, 1 = apex)
-  baseTuck: 0.05,
-  bulgeAmount: 0.06,
-  bulgeCenter: 0.45,
+  // ── Peak sharpening ──────────────────────────────────────────────────────
+  // Applied after Bézier:  r = bezierBase × (1−t)^peakPower,  r = max(r, 0.5)
+  // Collapses crown to a single voxel — mountain-like convergence.
+  peakPower: 0.45,
 
-  // Shell thickness: base value used by dynamicShellThickness()
-  shellThickness: 0.28,
-
-  // Inner cavity sculpting: fraction of full thickness applied at the very base (t=0).
-  // Lower = wider cavity at base, tightens smoothly toward apex.
-  shellThicknessBase: 0.45,
-
-  // Rim lip: structural mass thickening at the shell base edge.
-  // rimLipHeight: height fraction (0–1) over which lip fades out.
-  // rimLipExtend: outward radius extension at base (normalized, multiplied by shellRadius).
-  rimLipHeight: 0.15,
-  rimLipExtend: 0.08,
-
-  // Stepped plinth definition: layers from ground (y=0) upward.
-  // radiusFrac is relative to the circular base radius (40 blocks).
-  // Each step is visually distinct and 2–3 blocks shorter in footprint.
+  // ── Plinth steps ─────────────────────────────────────────────────────────
+  // radiusFrac relative to scaled plinth radius (40 × radiusScale ≈ 47 blocks).
   plinthSteps: [
-    { yFrom: 0, yTo: 2, radiusFrac: 1.000, block: "smooth_quartz" }, // outermost ground ring
-    { yFrom: 2, yTo: 4, radiusFrac: 0.875, block: "smooth_quartz" }, // middle step
-    { yFrom: 4, yTo: 5, radiusFrac: 0.775, block: "smooth_quartz" }, // top step: dome platform
+    { yFrom: 0, yTo: 2, radiusFrac: 1.000, block: 'smooth_quartz' }, // outer ring
+    { yFrom: 2, yTo: 4, radiusFrac: 0.875, block: 'smooth_quartz' }, // middle step
+    { yFrom: 4, yTo: 5, radiusFrac: 0.775, block: 'smooth_quartz' }, // top step
   ] as const,
 
-  // Block types
-  baseBlock: "smooth_quartz",
-  shellBlock: "cyan_terracotta",   // Turquoise like real monument
-  rimBlock: "cyan_concrete",
-  rimWidth: 2,
+  // ── Block types ──────────────────────────────────────────────────────────
+  baseBlock:        'smooth_quartz',
+  shellBlock:       'cyan_terracotta',   // turquoise, matches real monument
+  shellStairBlock:  'prismarine_stairs', // prismarine has stairs + slabs in Bedrock
+  shellSlabBlock:   'prismarine_slab',
+  rimBlock:         'cyan_concrete',     // cut-face highlight
+  rimWidth:         2,
+  plinthSlabBlock:  'smooth_quartz_slab',
 
-  // Sub-block detail: stair/slab variants used for curvature smoothing.
-  // These must be valid Minecraft block IDs; blockState is stored in extras[].blockState.
-  shellStairBlock: "cyan_concrete_stairs",  // outer dome surface where dR/dy ≈ 0.9–2.0 blocks/layer
-  shellSlabBlock: "cyan_concrete_slab",     // outer dome surface where dR/dy ≈ 0.3–0.9 blocks/layer
-  plinthSlabBlock: "smooth_quartz_slab",    // top outer-ring chamfer on each plinth step
+  // ── Shell band (HOLLOW enforcement) ──────────────────────────────────────
+  // Voxel placed only when  r − shellThickness ≤ dist ≤ r + shellEpsilon.
+  shellThickness: 1.0,
+  shellEpsilon:   0.15,
+
+  // ── Base gap fix ──────────────────────────────────────────────────────────
+  // First N dome layers above the plinth use a slightly wider band to close
+  // the 1-voxel void ring at the shell-platform junction.
+  baseGapLayers:    8,
+  baseGapThickness: 1.15,
+  baseGapEpsilon:   0.35,
+
+  // ── Curvature smoothing zones ─────────────────────────────────────────────
+  // slope = |r(yi+1) − r(yi−1)| / 2  (centred, in blocks per layer)
+  //   slope < drSlabMin               → FULL BLOCK
+  //   drSlabMin  ≤ slope < drStairMin → SLAB
+  //   drStairMin ≤ slope < drStairMax → STAIR (anti-teeth enforced)
+  //   slope ≥ drStairMax              → FULL BLOCK (too steep)
+  drSlabMin:  0.15,
+  drStairMin: 0.45,
+  drStairMax: 0.90,
 };
 
-// ============================================================================
-// GEOMETRY HELPERS
-// ============================================================================
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function emptyGrid(w: number, d: number): string[][] {
-  return Array.from({ length: d }, () => Array.from({ length: w }, () => "."));
+  return Array.from({ length: d }, () => Array.from({ length: w }, () => '.'));
 }
 
-function setCell(grid: string[][], x: number, z: number, v: string) {
-  if (z >= 0 && z < grid.length && x >= 0 && x < grid[0].length) {
-    grid[z][x] = v;
-  }
+function setCell(grid: string[][], x: number, z: number, v: string): void {
+  if (z >= 0 && z < grid.length && x >= 0 && x < grid[0].length) grid[z][x] = v;
 }
 
-/**
- * Al-Shaheed specific radius profile:
- * - Phase 1 (0% to slowPhaseEnd): radius shrinks VERY slowly
- * - Phase 2 (slowPhaseEnd to 100%): aggressive exponential taper to point
- * 
- * This creates the characteristic "fat for most of height, then pinches sharply" shape.
- */
+/** Two-phase radius profile — used only by generateSingleSplitDome. */
 function alShaheedRadius(t: number, baseExponent: number): number {
-  const { slowPhaseEnd, slowPhaseShrink, fastPhaseExponent } = CONFIG;
-  
+  const slowPhaseEnd = 0.60, slowPhaseShrink = 0.15, fastPhaseExp = 3.0;
   const tc = Math.max(0, Math.min(1, t));
-  
-  if (tc <= slowPhaseEnd) {
-    // SLOW PHASE: very gradual shrink
-    // At t=0: r=1.0, at t=slowPhaseEnd: r=(1-slowPhaseShrink)
-    const phaseT = tc / slowPhaseEnd;
-    return 1.0 - slowPhaseShrink * phaseT;
-  } else {
-    // FAST PHASE: aggressive exponential taper
-    // Map tc from [slowPhaseEnd, 1] to [0, 1]
-    const phaseT = (tc - slowPhaseEnd) / (1 - slowPhaseEnd);
-    // Start from where slow phase ended
-    const startR = 1.0 - slowPhaseShrink;
-    // Exponential decay to near-zero
-    return startR * Math.pow(1 - phaseT, fastPhaseExponent * baseExponent);
-  }
+  if (tc <= slowPhaseEnd) return 1.0 - slowPhaseShrink * (tc / slowPhaseEnd);
+  const phaseT = (tc - slowPhaseEnd) / (1 - slowPhaseEnd);
+  return (1.0 - slowPhaseShrink) * Math.pow(1 - phaseT, fastPhaseExp * baseExponent);
 }
 
 /**
- * Determines if a point is in the "kept" half of a shell.
- * Each shell is cut through its center - we keep one half.
- * Shell A: keep the LEFT half (facing outward/away from B)
- * Shell B: keep the RIGHT half (facing outward/away from A)
- * Rotated 180° from inward-facing configuration.
+ * Returns true if voxel (x,z) belongs to the kept half of the given shell.
+ * Each shell is cut through its centre; halfOverlap controls how many blocks
+ * past the cut plane remain visible (creating the visual intersection at the top).
  */
 function isInShellHalf(
-  x: number, z: number,
-  cx: number, cz: number,
-  shell: 'A' | 'B'
+  x: number, _z: number,
+  cx: number, _cz: number,
+  shell: 'A' | 'B',
 ): boolean {
-  // Vector from shell center to point
   const dx = x - cx;
-
-  // Shells face OUTWARD (away from each other)
-  // Shell A (left): keep points where x < cx (left half, facing outward)
-  // Shell B (right): keep points where x > cx (right half, facing outward)
-  if (shell === 'A') {
-    return dx <= 2;  // Keep left half of shell A (facing outward)
-  } else {
-    return dx >= -2; // Keep right half of shell B (facing outward)
-  }
+  return shell === 'A' ? dx <= CONFIG.halfOverlap : dx >= -CONFIG.halfOverlap;
 }
 
 function ellipticalDistance(
   x: number, z: number,
   cx: number, cz: number,
-  rx: number, rz: number
+  rx: number, rz: number,
 ): number {
-  const dx = (x - cx) / rx;
-  const dz = (z - cz) / rz;
-  return Math.sqrt(dx * dx + dz * dz);
+  return Math.sqrt(((x - cx) / rx) ** 2 + ((z - cz) / rz) ** 2);
 }
 
 /**
- * Structural rim lip factor.
+ * Raw cubic Bézier dome radius at t ∈ [0,1].
  *
- * Returns the amount (normalized, 0–rimLipExtend) by which the outer shell
- * radius is expanded at height t. Full at t=0, cosine-eased to zero by
- * t=rimLipHeight. This creates a thickened structural base lip without
- * introducing any new geometry type.
+ *   B(t) = Σ C(3,k) (1−t)^(3−k) t^k  P_k
+ *
+ * @param radius  Effective radius in blocks (pass R2 for the scaled version).
+ *                Defaults to CONFIG.shellRadius for backward compatibility.
  */
-function rimLipFactor(t: number): number {
-  const { rimLipHeight, rimLipExtend } = CONFIG;
-  if (t >= rimLipHeight) return 0;
-  const phase = t / rimLipHeight;
-  // Cosine ease: 1 at phase=0, 0 at phase=1
-  return rimLipExtend * 0.5 * (1 + Math.cos(Math.PI * phase));
+function bezierDomeRadius(t: number, radius = CONFIG.shellRadius): number {
+  const { bezierP0, bezierP1, bezierP2, bezierP3 } = CONFIG;
+  const tc = Math.max(0, Math.min(1, t)), mt = 1 - tc;
+  return mt ** 3 * (bezierP0 * radius)
+       + 3 * mt ** 2 * tc * (bezierP1 * radius)
+       + 3 * mt * tc ** 2 * (bezierP2 * radius)
+       + tc ** 3 * (bezierP3 * radius);
 }
 
 /**
- * Dynamic shell wall thickness as a function of height t (0=base, 1=apex).
+ * Scaled + peak-sharpened dome radius at t ∈ [0,1].
  *
- * At the base (t=0): multiplied by shellThicknessBase (< 1) → thin wall,
- * wide inner cavity. At the apex (t=1): full shellThickness → wall closes in.
- * Smooth power curve — no hard thresholds.
+ * Two-stage:
+ *   1. Bézier profile with effective radius R2 = shellRadius × radiusScale.
+ *   2. Peak sharpening:  r = bezierBase × (1−t)^peakPower
+ *      → Crown collapses to 0, clamped to 0.5 → single-voxel apex.
+ *
+ * The strict shell band [r − shellThickness, r + shellEpsilon] applied to
+ * this value guarantees a fully HOLLOW shell.
  */
-function dynamicShellThickness(t: number): number {
-  const { shellThickness, shellThicknessBase } = CONFIG;
-  // Power curve: starts at shellThicknessBase, approaches 1.0 smoothly
-  const eased = shellThicknessBase + (1 - shellThicknessBase) * Math.pow(t, 0.60);
-  return shellThickness * eased;
+function computeDomeRadius(t: number, R2: number): number {
+  const tc = Math.max(0, Math.min(1, t));
+  const base = bezierDomeRadius(tc, R2);
+  const sharpened = base * Math.pow(1 - tc, CONFIG.peakPower);
+  return Math.max(sharpened, 0.5);
 }
 
-/**
- * Radial profile scale: smooth "in → out → in" multiplier applied to alShaheedRadius().
- *
- *   s(0)           ≈ 1 - baseTuck            — base tucked inward
- *   s(bulgeCenter) ≈ 1 + bulgeAmount         — mid-lower bulge
- *   s(1)           ≈ 1                       — apex unaffected (alShaheedRadius handles pinch)
- *
- * Composed of two smooth terms:
- *   tuck  — quadratic decay from baseTuck at t=0, zero by t = bulgeCenter×0.65
- *   bulge — Gaussian bell (σ=0.22) centered at bulgeCenter
- *
- * Tuning:
- *   baseTuck    ↑  → more aggressive inward base
- *   bulgeAmount ↑  → wider mid-section flare
- *   bulgeCenter ↓  → flare starts lower; ↑ → flare starts higher
- */
-function profileScale(t: number): number {
-  const { baseTuck, bulgeAmount, bulgeCenter } = CONFIG;
-  const tuckEnd   = bulgeCenter * 0.65;
-  const tuckFrac  = Math.pow(Math.max(0, 1 - t / tuckEnd), 2); // quadratic ease-out
-  const tuck      = baseTuck * tuckFrac;
-  const sigma     = 0.22;
-  const bulge     = bulgeAmount * Math.exp(-0.5 * ((t - bulgeCenter) / sigma) ** 2);
-  return 1 - tuck + bulge;
-}
-
-/**
- * Stair facing direction for a block at (x, z) relative to dome center (cx, cz).
- *
- * Convention: facing = the direction the FULL-BLOCK portion faces = outward from center.
- * This gives the stair its slope on the interior side, smoothing the dome's outer surface.
- *
- * Dominant-axis rule maps the radial direction to one of the 4 cardinals:
- *   block east  of center → 'east'   (full face outward to the east)
- *   block west  of center → 'west'
- *   block south of center → 'south'
- *   block north of center → 'north'
- */
-function getStairFacing(
-  x: number, z: number,
-  cx: number, cz: number
-): 'north' | 'south' | 'east' | 'west' {
-  const dx = x - cx;
-  const dz = z - cz;
-  if (Math.abs(dx) >= Math.abs(dz)) {
-    return dx >= 0 ? 'east' : 'west';
-  }
-  return dz >= 0 ? 'south' : 'north';
-}
-
-/**
- * Classifies the dome outer surface slope at a given slice into a smoothing type.
- *
- * dRdy = (outerRadius[y] − outerRadius[y+1]) * shellRadius  (blocks per 1 y-layer).
- * Positive = dome is narrowing (normal case going up).
- *
- * Rules:
- *   dRdy < 0.3              → 'none'  — plateau; full block, no gap to bridge
- *   0.3 ≤ dRdy < 0.9       → 'slab'  — gentle slope; half-block inset hides the step
- *   0.9 ≤ dRdy < 2.0       → 'stair' — moderate slope; stair bevels the transition
- *   dRdy ≥ 2.0             → 'none'  — steep cliff; stair geometry can't meaningfully smooth
- */
-function outerSurfaceSmoothType(dRdy: number): 'none' | 'slab' | 'stair' {
-  if (dRdy < 0.30) return 'none';
-  if (dRdy < 0.90) return 'slab';
-  if (dRdy < 2.00) return 'stair';
-  return 'none';
-}
-
-// ============================================================================
-// MAIN GENERATOR
-// ============================================================================
+// ─── Main Generator ───────────────────────────────────────────────────────────
 
 export function generateAlShaheedLikeBlueprint(enableRim = true): Blueprint {
   const {
     W, D, H, baseThickness,
+    shellRadius, radiusScale, heightScale,
     cxA, czA, cxB, czB,
-    shellRadius, shellExponent,
-    baseBlock, shellBlock, rimBlock, rimWidth,
-    shellStairBlock, shellSlabBlock, plinthSlabBlock,
+    baseBlock, shellBlock, shellStairBlock, shellSlabBlock,
+    rimBlock, rimWidth, plinthSlabBlock,
+    shellThickness, shellEpsilon,
+    baseGapLayers, baseGapThickness, baseGapEpsilon,
+    drSlabMin, drStairMin, drStairMax,
   } = CONFIG;
 
-  // Both shells use identical radii (real monument has equal halves)
-  const rxA = shellRadius;
-  const rzA = shellRadius;
-  const rxB = shellRadius;
-  const rzB = shellRadius;
-  const exponentA = shellExponent;
-  const exponentB = shellExponent;
+  // ── Derived geometry ───────────────────────────────────────────────────────
+  const R2 = shellRadius * radiusScale;     // 23.6 blocks effective radius
+  const H2 = Math.round(H * heightScale);   // 59 total height (plinth + dome)
+  const domeHeight = H2 - baseThickness;    // 54 dome layers
+  const layerCount = domeHeight + 1;        // yi: 0 … 54
 
   const slices: Slice[] = [];
-  let totalBlocks = 0;
-  let nonEmptySlices = 0;
-  let maxYWithBlocks = 0;
+  let totalBlocks = 0, nonEmptySlices = 0, maxYWithBlocks = 0;
 
-  console.log(`generateMonumentBlueprint.ts: Generating Al-Shaheed Monument...`);
-  console.log(`  - Grid: ${W}×${D}×${H}`);
-  console.log(`  - Shell A: center=(${cxA},${czA}), radius=${shellRadius}`);
-  console.log(`  - Shell B: center=(${cxB},${czB}), radius=${shellRadius}`);
-  console.log(`  - S-offset: Z difference = ${Math.abs(czA - czB)} blocks`);
+  console.log('generateMonumentBlueprint.ts: Generating Al-Shaheed Monument...');
+  console.log(`  Grid=${W}×${D}  R2=${R2.toFixed(1)}  H2=${H2}  domeHeight=${domeHeight}`);
+  console.log(`  Shell A: (${cxA},${czA})  Shell B: (${cxB},${czB})  overlap=±${CONFIG.halfOverlap}`);
 
-  // -------------------------------------------------------------------------
-  // STEPPED PLINTH (base hierarchy)
-  //
-  // Three stepped rings that lift the structure off the ground plane.
-  // Each step is inset ~5-6 blocks from the one below, using the same
-  // circular geometry as the original flat base — no new mesh types.
-  // -------------------------------------------------------------------------
-  const baseCx = Math.floor(W / 2);
-  const baseCz = Math.floor(D / 2);
-  const baseRadius = 40; // Outermost plinth ring radius (blocks)
+  // ── PLINTH (stepped rings) ─────────────────────────────────────────────────
+  const baseCx = Math.floor(W / 2);  // 50
+  const baseCz = Math.floor(D / 2);  // 50
+  const baseRadius = Math.round(40 * radiusScale); // ≈47 blocks from centre
 
   for (const step of CONFIG.plinthSteps) {
     const stepR = baseRadius * step.radiusFrac;
-    // Outer-ring threshold: cells whose normalised distance is within ~1.5 blocks of the edge.
-    // These get a top-slab chamfer on the topmost layer of each step to soften the step corner.
     const outerRingThreshold = 1.0 - 1.5 / stepR;
-    const isLastStep = step.yTo === baseThickness; // top platform — no chamfer (dome sits here)
+    const isLastStep = step.yTo === baseThickness;
 
     for (let y = step.yFrom; y < step.yTo; y++) {
       const g = emptyGrid(W, D);
@@ -355,11 +250,8 @@ export function generateAlShaheedLikeBlueprint(enableRim = true): Blueprint {
         for (let x = 0; x < W; x++) {
           const d = ellipticalDistance(x, z, baseCx, baseCz, stepR, stepR);
           if (d <= 1.0) {
-            setCell(g, x, z, "#");
+            setCell(g, x, z, '#');
             totalBlocks++;
-
-            // Top-layer outer ring on the lower two steps → upside-down slab.
-            // Creates a visible chamfer between the step face and the step top.
             if (isTopLayer && !isLastStep && d >= outerRingThreshold) {
               extras.push({ x, z, blockType: plinthSlabBlock, blockState: { type: 'top' } });
             }
@@ -367,7 +259,7 @@ export function generateAlShaheedLikeBlueprint(enableRim = true): Blueprint {
         }
       }
 
-      const sliceData: Slice = { y, block: step.block, grid: g.map(row => row.join("")) };
+      const sliceData: Slice = { y, block: step.block, grid: g.map(r => r.join('')) };
       if (extras.length > 0) sliceData.extras = extras;
       slices.push(sliceData);
       nonEmptySlices++;
@@ -375,231 +267,233 @@ export function generateAlShaheedLikeBlueprint(enableRim = true): Blueprint {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // DOME SHELLS with CURVED OPENING and ASYMMETRY
-  // -------------------------------------------------------------------------
-  const domeHeight = H - baseThickness;
+  // ── PRE-COMPUTE DOME RADII ─────────────────────────────────────────────────
+  // Build the full radii array up-front so centred slopes are O(1) per layer.
+  const radii: number[] = [];
+  for (let i = 0; i < layerCount; i++) radii.push(computeDomeRadius(i / domeHeight, R2));
 
-  for (let y = baseThickness; y <= H; y++) {
-    const relY = y - baseThickness;
-    const t = relY / domeHeight;
+  // Anti-teeth guard: stair positions in the previous dome layer.
+  const prevLayerStairs = new Set<string>();
 
-    // Calculate radius for each dome, scaled by the "in → out → in" profile.
-    const s  = profileScale(t);
-    const rA = alShaheedRadius(t, exponentA) * s;
-    const rB = alShaheedRadius(t, exponentB) * s;
+  // ── DOME SHELLS ────────────────────────────────────────────────────────────
+  //
+  // HOLLOW CONTRACT enforcement:
+  //   A voxel at dist from dome centre is placed only if:
+  //     dist ≥ r − thick   (outer side of the hollow band inner wall)
+  //     dist ≤ r + eps     (outer side of the hollow band outer wall)
+  //   Nothing at dist < r − thick is ever placed.
+  //   A post-placement hollow-validation sweep (below) removes any
+  //   voxel that slipped inside dist < r − 1.3 for both shells.
+  //
+  for (let yi = 0; yi < layerCount; yi++) {
+    const y    = baseThickness + yi;
+    const r    = radii[yi];
 
-    // Structural rim lip: extends outer radius at base, fades by t=rimLipHeight.
-    // Same block type as shell — reads as mass, not ornament.
-    const lip = rimLipFactor(t);
+    // Centred slope: smoother than per-layer dr, prevents stair-zone noise.
+    const rPrev = yi > 0              ? radii[yi - 1] : r;
+    const rNext = yi + 1 < layerCount ? radii[yi + 1] : r;
+    const slope  = Math.abs(rNext - rPrev) / 2;
+    const drDir  = rNext - r; // sign: >0 expanding, <0 shrinking
 
-    // Dynamic inner thickness: thin wall at base (wide cavity), thickens toward apex.
-    const dynThickness = dynamicShellThickness(t);
+    // Base-gap wider band for the first N layers above the plinth.
+    const thick = yi < baseGapLayers ? baseGapThickness : shellThickness;
+    const eps   = yi < baseGapLayers ? baseGapEpsilon   : shellEpsilon;
 
-    // Shell bands (outer includes lip extension; inner uses dynamic thickness)
-    const rOuterA = rA + lip;
-    const rInnerA = Math.max(0, rA - dynThickness);
-    const rOuterB = rB + lip;
-    const rInnerB = Math.max(0, rB - dynThickness);
-
-    const g = emptyGrid(W, D);
+    const g                  = emptyGrid(W, D);
     const extras: SliceExtra[] = [];
+    const currentLayerStairs   = new Set<string>();
     let sliceBlocks = 0;
 
-    if (rA < 0.02 && rB < 0.02) {
-      slices.push({ y, block: shellBlock, grid: g.map(row => row.join("")) });
+    // Skip layers whose radius is sub-voxel (peak clamp keeps r ≥ 0.5, so
+    // this only triggers if the computation dips below 0.5 through float noise).
+    if (r < 0.5) {
+      slices.push({ y, block: shellBlock, grid: g.map(row => row.join('')) });
+      prevLayerStairs.clear();
       continue;
     }
 
-    // Pre-compute stair/slab type for each shell's outer surface at this height.
-    // dRdy = how many blocks the outer radius shrinks going to the next y-layer.
-    // Used to pick: none | slab | stair for outer-ring cells.
-    const dt = 1 / domeHeight;
-    const tNext = Math.min(1, t + dt);
-    const sNext  = profileScale(tNext);
-    const rANext = alShaheedRadius(tNext, exponentA) * sNext + rimLipFactor(tNext);
-    const rBNext = alShaheedRadius(tNext, exponentB) * sNext + rimLipFactor(tNext);
-    const dRdyA = (rOuterA - rANext) * shellRadius; // blocks per 1-layer step, Shell A
-    const dRdyB = (rOuterB - rBNext) * shellRadius; // blocks per 1-layer step, Shell B
-    const smoothA = outerSurfaceSmoothType(dRdyA);
-    const smoothB = outerSurfaceSmoothType(dRdyB);
-
-    // Width of the outer ring eligible for stair/slab: ~1.5 blocks from the outer surface.
-    const OUTER_RING_W = 1.5 / shellRadius;
-
+    // ── Voxel placement ──────────────────────────────────────────────────────
     for (let z = 0; z < D; z++) {
       for (let x = 0; x < W; x++) {
-        let placed = false;
-        // Track which shell placed this block and its smooth-type, for extra generation.
-        let smoothType: 'none' | 'slab' | 'stair' = 'none';
-        let placedCx = 0, placedCz = 0;
+        let dist = 0, shellCx = 0, shellCz = 0, inShell = false;
 
-        // --- SHELL A ---
-        if (rA >= 0.02 && isInShellHalf(x, z, cxA, czA, 'A')) {
-          const dA = ellipticalDistance(x, z, cxA, czA, rxA, rzA);
-          if (dA >= rInnerA && dA <= rOuterA) {
-            placed = true;
-            placedCx = cxA; placedCz = czA;
-            // Outer ring: cells within OUTER_RING_W of the outer surface edge
-            smoothType = (dA >= rOuterA - OUTER_RING_W) ? smoothA : 'none';
+        // Shell A — checked first; if it claims this cell, Shell B is skipped.
+        const dA = Math.sqrt((x - cxA) ** 2 + (z - czA) ** 2);
+        if (dA >= r - thick && dA <= r + eps && isInShellHalf(x, z, cxA, czA, 'A')) {
+          inShell = true; dist = dA; shellCx = cxA; shellCz = czA;
+        }
+
+        // Shell B — only if Shell A didn't claim the cell.
+        if (!inShell) {
+          const dB = Math.sqrt((x - cxB) ** 2 + (z - czB) ** 2);
+          if (dB >= r - thick && dB <= r + eps && isInShellHalf(x, z, cxB, czB, 'B')) {
+            inShell = true; dist = dB; shellCx = cxB; shellCz = czB;
           }
         }
 
-        // --- SHELL B ---
-        if (!placed && rB >= 0.02 && isInShellHalf(x, z, cxB, czB, 'B')) {
-          const dB = ellipticalDistance(x, z, cxB, czB, rxB, rzB);
-          if (dB >= rInnerB && dB <= rOuterB) {
-            placed = true;
-            placedCx = cxB; placedCz = czB;
-            smoothType = (dB >= rOuterB - OUTER_RING_W) ? smoothB : 'none';
-          }
-        }
+        if (!inShell) continue;
 
-        if (placed) {
-          setCell(g, x, z, "#");
+        setCell(g, x, z, '#');
+        totalBlocks++;
+        sliceBlocks++;
+
+        // err < 0: voxel centre is inward of surface radius r
+        // err > 0: voxel centre is outward of surface radius r
+        const err     = dist - r;
+        const cellKey = `${x},${z}`;
+
+        // ── 4-zone block selection ────────────────────────────────────────────
+        //   FULL BLOCK: slope outside [drSlabMin, drStairMax)
+        //   SLAB:       drSlabMin ≤ slope < drStairMin  (or stair anti-teeth fallback)
+        //   STAIR:      drStairMin ≤ slope < drStairMax, no stair on (x,z,y−1)
+        if (slope >= drSlabMin && slope < drStairMax) {
+
+          if (slope >= drStairMin && !prevLayerStairs.has(cellKey)) {
+            // ── STAIR ────────────────────────────────────────────────────────
+            const dx = x - shellCx, dz = z - shellCz;
+            let facing: 'east' | 'west' | 'north' | 'south';
+            if (Math.abs(dx) >= Math.abs(dz)) facing = dx > 0 ? 'east' : 'west';
+            else                              facing = dz > 0 ? 'south' : 'north';
+
+            // top half (upside-down) when crown is contracting (drDir < 0);
+            // bottom half when dome is expanding (drDir ≥ 0).
+            const half: 'top' | 'bottom' = drDir < 0 ? 'top' : 'bottom';
+
+            extras.push({ x, z, blockType: shellStairBlock,
+              blockState: { facing, half, shape: 'straight' } });
+            currentLayerStairs.add(cellKey);
+
+          } else {
+            // ── SLAB ─────────────────────────────────────────────────────────
+            // Also the anti-teeth fallback when the stair guard fires.
+            // Top slab when voxel sticks outward (err > 0);
+            // bottom slab when voxel is inward (err < 0).
+            const slabType: 'top' | 'bottom' = err > 0 ? 'top' : 'bottom';
+            extras.push({ x, z, blockType: shellSlabBlock,
+              blockState: { type: slabType } });
+          }
+
+        }
+        // else FULL BLOCK — no extra, shellBlock is rendered for this cell.
+      }
+    }
+
+    // ── Stitching pass: close 1-voxel gaps in the ring ────────────────────────
+    // An empty cell that has ≥3 filled horizontal neighbours is a hole.
+    // Patch it if it also lies within 0.7 blocks of the shell surface.
+    for (let sz = 1; sz < D - 1; sz++) {
+      for (let sx = 1; sx < W - 1; sx++) {
+        if (g[sz][sx] !== '.') continue;
+
+        const filled = (g[sz][sx - 1] !== '.' ? 1 : 0)
+                     + (g[sz][sx + 1] !== '.' ? 1 : 0)
+                     + (g[sz - 1][sx] !== '.' ? 1 : 0)
+                     + (g[sz + 1][sx] !== '.' ? 1 : 0);
+        if (filled < 3) continue;
+
+        const dA = Math.sqrt((sx - cxA) ** 2 + (sz - czA) ** 2);
+        const dB = Math.sqrt((sx - cxB) ** 2 + (sz - czB) ** 2);
+        const nearA = Math.abs(dA - r) < 0.7 && isInShellHalf(sx, sz, cxA, czA, 'A');
+        const nearB = Math.abs(dB - r) < 0.7 && isInShellHalf(sx, sz, cxB, czB, 'B');
+
+        if (nearA || nearB) {
+          setCell(g, sx, sz, '#');
           totalBlocks++;
           sliceBlocks++;
-
-          // Emit stair or slab extra for outer-ring cells.
-          // The extra OVERRIDES this '#' cell in the voxelizer with the correct block type.
-          if (smoothType === 'slab') {
-            extras.push({
-              x, z,
-              blockType: shellSlabBlock,                       // "cyan_concrete_slab"
-              blockState: { type: 'bottom' },                  // sits in lower half
-            });
-          } else if (smoothType === 'stair') {
-            extras.push({
-              x, z,
-              blockType: shellStairBlock,                      // "cyan_concrete_stairs"
-              blockState: {
-                facing: getStairFacing(x, z, placedCx, placedCz), // outward from center
-                half: 'bottom',                                // step rises toward interior
-                shape: 'straight',
-              },
-            });
-          }
+          // Stitch voxels are always full blocks (no extra entry needed).
         }
       }
     }
 
-    const sliceData: Slice = { y, block: shellBlock, grid: g.map(row => row.join("")) };
+    // ── Hollow validation sweep ────────────────────────────────────────────────
+    // Remove any voxel whose distance from BOTH shell centres is less than
+    // r − 1.3 blocks (i.e., lies inside the hollow interior).
+    // In normal operation the band condition makes this a no-op; it is kept
+    // as a safety net against floating-point edge cases or future refactors.
+    for (let vz = 0; vz < D; vz++) {
+      for (let vx = 0; vx < W; vx++) {
+        if (g[vz][vx] === '.') continue;
+
+        const dA = Math.sqrt((vx - cxA) ** 2 + (vz - czA) ** 2);
+        const dB = Math.sqrt((vx - cxB) ** 2 + (vz - czB) ** 2);
+
+        // A voxel is valid if it is in the shell band of at least one shell.
+        // We use 1.3 (slightly above baseGapThickness=1.15) to catch stitch voxels.
+        const okA = dA >= r - 1.3 && isInShellHalf(vx, vz, cxA, czA, 'A');
+        const okB = dB >= r - 1.3 && isInShellHalf(vx, vz, cxB, czB, 'B');
+
+        if (!okA && !okB) {
+          g[vz][vx] = '.';
+          totalBlocks--;
+          sliceBlocks--;
+        }
+      }
+    }
+
+    // ── Emit slice ─────────────────────────────────────────────────────────────
+    const sliceData: Slice = { y, block: shellBlock, grid: g.map(row => row.join('')) };
     if (extras.length > 0) sliceData.extras = extras;
     slices.push(sliceData);
 
-    if (sliceBlocks > 0) {
-      nonEmptySlices++;
-      maxYWithBlocks = y;
-    }
+    // Advance anti-teeth state to next layer.
+    prevLayerStairs.clear();
+    for (const k of currentLayerStairs) prevLayerStairs.add(k);
+
+    if (sliceBlocks > 0) { nonEmptySlices++; maxYWithBlocks = y; }
   }
 
-  // -------------------------------------------------------------------------
-  // RIM SLICES (curved edge highlight)
-  // -------------------------------------------------------------------------
+  // ── RIM (cut-face highlight) ───────────────────────────────────────────────
   if (enableRim) {
-    for (let y = baseThickness; y <= H; y++) {
-      const relY = y - baseThickness;
-      const t = relY / domeHeight;
-
-      // Match shell loop exactly: same profileScale + lip + dynamic thickness
-      const sRim = profileScale(t);
-      const rA = alShaheedRadius(t, exponentA) * sRim;
-      const rB = alShaheedRadius(t, exponentB) * sRim;
-
-      if (rA < 0.02 && rB < 0.02) continue;
-
-      const lip = rimLipFactor(t);
-      const dynThickness = dynamicShellThickness(t);
-
-      const rOuterA = rA + lip;
-      const rInnerA = Math.max(0, rA - dynThickness);
-      const rOuterB = rB + lip;
-      const rInnerB = Math.max(0, rB - dynThickness);
+    for (let y = baseThickness; y <= H2; y++) {
+      const t = (y - baseThickness) / domeHeight;
+      const r = computeDomeRadius(t, R2);
+      if (r < 0.5) continue;
 
       const g = emptyGrid(W, D);
-      const rimExtras: SliceExtra[] = [];
       let hasRim = false;
 
       for (let z = 0; z < D; z++) {
         for (let x = 0; x < W; x++) {
-          // Shell A cut-face rim
-          const dxA = x - cxA;
-          if (Math.abs(dxA) <= rimWidth && rA >= 0.02 && isInShellHalf(x, z, cxA, czA, 'A')) {
-            const dA = ellipticalDistance(x, z, cxA, czA, rxA, rzA);
-            if (dA >= rInnerA && dA <= rOuterA) {
-              setCell(g, x, z, "#");
-              hasRim = true;
-              // Bevel: innermost column of the rim (|dxA| ≤ 1) gets an upside-down stair
-              // facing east (into the dome interior), creating a heavy chamfered lip.
-              if (Math.abs(dxA) <= 1) {
-                rimExtras.push({
-                  x, z,
-                  blockType: rimBlock + '_stairs',    // "cyan_concrete_stairs"
-                  blockState: { facing: 'east', half: 'top', shape: 'straight' },
-                });
-              }
+          // Shell A cut-face
+          if (Math.abs(x - cxA) <= rimWidth && isInShellHalf(x, z, cxA, czA, 'A')) {
+            if (Math.sqrt((x - cxA) ** 2 + (z - czA) ** 2) <= r + 0.5) {
+              setCell(g, x, z, '#'); hasRim = true;
             }
           }
-
-          // Shell B cut-face rim
-          const dxB = x - cxB;
-          if (Math.abs(dxB) <= rimWidth && rB >= 0.02 && isInShellHalf(x, z, cxB, czB, 'B')) {
-            const dB = ellipticalDistance(x, z, cxB, czB, rxB, rzB);
-            if (dB >= rInnerB && dB <= rOuterB) {
-              setCell(g, x, z, "#");
-              hasRim = true;
-              if (Math.abs(dxB) <= 1) {
-                rimExtras.push({
-                  x, z,
-                  blockType: rimBlock + '_stairs',
-                  blockState: { facing: 'west', half: 'top', shape: 'straight' },
-                });
-              }
+          // Shell B cut-face
+          if (Math.abs(x - cxB) <= rimWidth && isInShellHalf(x, z, cxB, czB, 'B')) {
+            if (Math.sqrt((x - cxB) ** 2 + (z - czB) ** 2) <= r + 0.5) {
+              setCell(g, x, z, '#'); hasRim = true;
             }
           }
         }
       }
 
-      if (hasRim) {
-        const rimSlice: Slice = { y, block: rimBlock, grid: g.map(row => row.join("")) };
-        if (rimExtras.length > 0) rimSlice.extras = rimExtras;
-        slices.push(rimSlice);
-      }
+      if (hasRim) slices.push({ y, block: rimBlock, grid: g.map(r => r.join('')) });
     }
   }
 
-  console.log(`generateMonumentBlueprint.ts: Generation complete!`);
-  console.log(`  - Total slices: ${slices.length}`);
-  console.log(`  - Non-empty slices: ${nonEmptySlices}`);
-  console.log(`  - Max Y with blocks: ${maxYWithBlocks}`);
-  console.log(`  - Total blocks: ~${totalBlocks}`);
+  console.log(`  Done: ${slices.length} slices, ~${totalBlocks} blocks, maxY=${maxYWithBlocks}`);
 
   return {
-    description: `Al-Shaheed Monument: Two identical half-domes in S-shaped offset. Radius=${shellRadius}, S-offset=${Math.abs(czA - czB)} blocks. 3-step plinth, sculpted inner cavity, structural base lip.`,
-    recommended_block_palette: {
-      primary: shellBlock,
-      secondary: rimBlock,
-      base: baseBlock,
-    },
-    dimensions_estimate: { width: W, depth: D, height: H },
+    description: `Al-Shaheed Monument (hollow shell): R2=${R2.toFixed(1)}, H2=${H2}, ` +
+                 `peak sharpening p=${CONFIG.peakPower}, base-gap stitched, anti-teeth stairs.`,
+    recommended_block_palette: { primary: shellBlock, secondary: rimBlock, base: baseBlock },
+    dimensions_estimate: { width: W, depth: D, height: H2 },
     slices,
   };
 }
 
-/**
- * Generates a simpler single split dome for testing.
- */
+// ─── Test Helper ──────────────────────────────────────────────────────────────
+
+/** Generates a simpler single split dome for isolated testing. */
 export function generateSingleSplitDome(
   radius = 12,
   height = 30,
-  splitSide: 'left' | 'right' = 'right'
+  splitSide: 'left' | 'right' = 'right',
 ): Blueprint {
-  const W = radius * 3;
-  const D = radius * 3;
-  const H = height;
-  const cx = Math.floor(W / 2);
-  const cz = Math.floor(D / 2);
-
+  const W = radius * 3, D = radius * 3, H = height;
+  const cx = Math.floor(W / 2), cz = Math.floor(D / 2);
   const slices: Slice[] = [];
 
   for (let y = 0; y <= H; y++) {
@@ -608,34 +502,27 @@ export function generateSingleSplitDome(
     const r = alShaheedRadius(t, 0.3);
 
     if (r < 0.01) {
-      slices.push({ y, block: "warped_concrete", grid: g.map(row => row.join("")) });
+      slices.push({ y, block: 'warped_concrete', grid: g.map(row => row.join('')) });
       continue;
     }
 
-    const rOuter = r;
-    const rInner = Math.max(0, r - 0.20);
+    const rOuter = r, rInner = Math.max(0, r - 0.20);
 
     for (let z = 0; z < D; z++) {
       for (let x = 0; x < W; x++) {
-        if (splitSide === 'left' && x > cx) continue;
+        if (splitSide === 'left'  && x > cx) continue;
         if (splitSide === 'right' && x < cx) continue;
-
         const d = ellipticalDistance(x, z, cx, cz, radius, radius);
-        if (d >= rInner && d <= rOuter) {
-          setCell(g, x, z, "#");
-        }
+        if (d >= rInner && d <= rOuter) setCell(g, x, z, '#');
       }
     }
 
-    slices.push({ y, block: "warped_concrete", grid: g.map(row => row.join("")) });
+    slices.push({ y, block: 'warped_concrete', grid: g.map(row => row.join('')) });
   }
 
   return {
     description: `Single split Al-Shaheed style dome (${splitSide} half)`,
-    recommended_block_palette: {
-      primary: "warped_concrete",
-      base: "smooth_quartz",
-    },
+    recommended_block_palette: { primary: 'warped_concrete', base: 'smooth_quartz' },
     dimensions_estimate: { width: W, depth: D, height: H },
     slices,
   };

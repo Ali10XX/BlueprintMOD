@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Grid, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 
@@ -16,7 +16,6 @@ import {
   validateBlueprint,
   voxelizeBlueprint,
   centerVoxels,
-  groupVoxelsByBlockType,
 } from './voxelizeBlueprint';
 
 // ============================================================================
@@ -619,10 +618,10 @@ export function VoxelPreview({
   }, [voxelResult]);
 
   // Calculate visible voxel count
+    const baseY = centered ? 0 : voxelResult.bounds.minY;
   const visibleCount = useMemo(() => {
     if (!voxelResult) return 0;
     
-    const baseY = centered ? 0 : voxelResult.bounds.minY;
     return voxelResult.voxels.filter(v => {
       if (showBaseOnly) return v.y === (centered ? 0 : voxelResult.bounds.minY);
       return v.y <= visibleMaxY;
