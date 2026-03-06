@@ -17,6 +17,8 @@ import {
   voxelizeBlueprint,
   centerVoxels,
 } from './voxelizeBlueprint';
+import { loadAllBlockColors } from '../../tools/minecraftColors';
+import { loadBlockTextures } from '../../tools/textureManager';
 
 // ============================================================================
 // BLOCK COLOR MAPPING
@@ -27,6 +29,16 @@ import {
  * Add new blocks here as needed.
  */
 const PREVIEW_BLOCK_COLORS: Record<string, string> = {
+  // Oxidized copper family (dome shell) — seafoam green patina
+  'waxed_oxidized_cut_copper':         '#5fb882',
+  'oxidized_cut_copper':               '#4da06e',
+  'waxed_oxidized_cut_copper_stairs':  '#5fb882',
+  'waxed_oxidized_cut_copper_slab':    '#5fb882',
+  'minecraft:waxed_oxidized_cut_copper':        '#5fb882',
+  'minecraft:oxidized_cut_copper':              '#4da06e',
+  'minecraft:waxed_oxidized_cut_copper_stairs': '#5fb882',
+  'minecraft:waxed_oxidized_cut_copper_slab':   '#5fb882',
+
   // Monument blocks (with minecraft: aliases)
   'warped_concrete': '#1a9a9a',       // Teal (warped nether)
   'minecraft:warped_concrete': '#1a9a9a',
@@ -41,6 +53,24 @@ const PREVIEW_BLOCK_COLORS: Record<string, string> = {
   'cyan_concrete_slab': '#16a5a5',
   'smooth_quartz_stairs': '#f0f0f0',
   'smooth_quartz_slab': '#f0f0f0',
+  'prismarine_stairs': '#5f9a9a',
+  'prismarine_slab': '#5f9a9a',
+
+  // Modern concrete variant
+  'light_blue_concrete': '#2cb2da',
+  'minecraft:light_blue_concrete': '#2cb2da',
+
+  // Marble / quartz variant
+  'quartz_slab': '#ede9d3',
+  'quartz_stairs': '#ede9d3',
+  'quartz_bricks': '#e8e3ca',
+  'minecraft:quartz_slab': '#ede9d3',
+  'minecraft:quartz_stairs': '#ede9d3',
+  'minecraft:quartz_bricks': '#e8e3ca',
+
+  // Calcite (geode stone)
+  'calcite': '#f4f2ec',
+  'minecraft:calcite': '#f4f2ec',
   
   // Common blocks
   'stone': '#7d7d7d',
@@ -55,6 +85,7 @@ const PREVIEW_BLOCK_COLORS: Record<string, string> = {
   'sandstone': '#d9cc8f',
   'red_sandstone': '#b85c2b',
   'prismarine': '#5f9a9a',
+  'prismarine_bricks': '#4d8a8a',
   'dark_prismarine': '#3a5f5f',
   'nether_bricks': '#2d1518',
   'obsidian': '#1a0a24',
@@ -109,9 +140,39 @@ const PREVIEW_BLOCK_COLORS: Record<string, string> = {
  * Strips 'minecraft:' prefix if present.
  */
 function getPreviewColor(blockType: string): string {
-  // Strip minecraft: prefix
   const cleanType = blockType.replace('minecraft:', '');
   return PREVIEW_BLOCK_COLORS[cleanType] || PREVIEW_BLOCK_COLORS['unknown'];
+}
+
+// ============================================================================
+// BLOCK MATERIAL PROPERTIES (roughness / metalness for MeshStandardMaterial)
+// ============================================================================
+
+const BLOCK_MATERIAL_PROPS: Record<string, { roughness: number; metalness: number }> = {
+  // Oxidized copper — patina-covered metal: high roughness, moderate metalness
+  'waxed_oxidized_cut_copper':         { roughness: 0.78, metalness: 0.30 },
+  'oxidized_cut_copper':               { roughness: 0.82, metalness: 0.28 },
+  'waxed_oxidized_cut_copper_stairs':  { roughness: 0.78, metalness: 0.30 },
+  'waxed_oxidized_cut_copper_slab':    { roughness: 0.78, metalness: 0.30 },
+  // Quartz / base — polished matte stone
+  'smooth_quartz':       { roughness: 0.92, metalness: 0.00 },
+  'smooth_quartz_slab':  { roughness: 0.92, metalness: 0.00 },
+  'chiseled_quartz_block':{ roughness: 0.88, metalness: 0.00 },
+  // Prismarine (kept for other blueprints)
+  'prismarine':          { roughness: 0.85, metalness: 0.05 },
+  'prismarine_bricks':   { roughness: 0.82, metalness: 0.05 },
+  'dark_prismarine':     { roughness: 0.88, metalness: 0.05 },
+  'prismarine_stairs':   { roughness: 0.85, metalness: 0.05 },
+  'prismarine_slab':     { roughness: 0.85, metalness: 0.05 },
+  // Other metals
+  'copper_block':        { roughness: 0.40, metalness: 0.60 },
+  'iron_block':          { roughness: 0.30, metalness: 0.80 },
+  'gold_block':          { roughness: 0.20, metalness: 0.90 },
+};
+
+function getBlockMaterialProps(blockType: string): { roughness: number; metalness: number } {
+  const clean = blockType.replace('minecraft:', '');
+  return BLOCK_MATERIAL_PROPS[clean] ?? { roughness: 0.85, metalness: 0.05 };
 }
 
 // ============================================================================
@@ -133,6 +194,24 @@ interface InstancedVoxelMeshProps {
   xOff?: number;
   yOff?: number;
   zOff?: number;
+  /**
+   * Global occupancy set for neighbor-based AO darkening.
+   * Keys are "${x},${y},${z}" strings in the same coordinate space as voxels.
+   * When provided, each voxel is darkened proportionally to its filled neighbors.
+   */
+  occSet?: ReadonlySet<string>;
+  /**
+   * Optional color map derived from Minecraft textures.
+   * Keys are clean block names (no 'minecraft:' prefix).
+   * When provided, overrides the static PREVIEW_BLOCK_COLORS table.
+   */
+  colorMap?: Map<string, string> | null;
+  /**
+   * Optional THREE.js texture map for this block type.
+   * When present, the texture is used as the material map instead of flat color.
+   * Per-instance color is still applied for AO darkening (white base → gray).
+   */
+  texture?: THREE.Texture | null;
 }
 
 /**
@@ -153,8 +232,11 @@ function InstancedVoxelMesh({
   xOff = 0,
   yOff = 0,
   zOff = 0,
+  occSet,
+  colorMap,
+  texture,
 }: InstancedVoxelMeshProps) {
-  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const meshRef    = useRef<THREE.InstancedMesh>(null);
   const tempMatrix = useMemo(() => new THREE.Matrix4(), []);
 
   const visibleVoxels = useMemo(() => {
@@ -164,38 +246,85 @@ function InstancedVoxelMesh({
     });
   }, [voxels, visibleMaxY, showBaseOnly, baseY]);
 
+  // Pre-compute the block color once — prefer texture-derived colorMap when available
+  const color = colorMap?.get(blockType.replace('minecraft:', ''))
+             ?? getPreviewColor(blockType);
+
   useEffect(() => {
     if (!meshRef.current) return;
 
-    // compose(position, quaternion, scale) correctly separates T, R, S —
-    // avoids the old makeTranslation+.scale() bug where .scale() also rescaled
-    // the translation vector, causing wrong positions at scale ≠ 1.
+    // compose(position, quaternion, scale) correctly separates T, R, S.
     const pos  = new THREE.Vector3();
-    const quat = new THREE.Quaternion(); // identity — no rotation needed
+    const quat = new THREE.Quaternion(); // identity
     const scl  = new THREE.Vector3(scale, scale, scale);
 
+    // When a texture is active the instance color is used ONLY for AO darkening.
+    // Start from white so the AO factor (0.76..1.0) produces a neutral gray
+    // that darkens the texture without introducing a color cast.
+    // Without a texture, use the block's preview hex for color-mode rendering.
+    const baseColor = new THREE.Color(texture ? '#ffffff' : color);
+    const aoColor   = new THREE.Color();
+
     visibleVoxels.forEach((voxel, i) => {
+      // ── Matrix ────────────────────────────────────────────────────────────
       pos.set(
         voxel.x * scale + xOff * scale,
         voxel.y * scale + yOff * scale,
-        voxel.z * scale + zOff * scale
+        voxel.z * scale + zOff * scale,
       );
       tempMatrix.compose(pos, quat, scl);
       meshRef.current!.setMatrixAt(i, tempMatrix);
+
+      // ── Neighbor-based AO ─────────────────────────────────────────────────
+      // Count filled face-adjacent neighbors. Each occupied neighbor
+      // contributes ~4 % darkening (max 24 % at fully enclosed block).
+      // The instanced color multiplies the material diffuse, so setting it
+      // to (f, f, f) simply scales the block's hue by the AO factor.
+      let occ = 0;
+      if (occSet) {
+        const { x, y, z } = voxel;
+        if (occSet.has(`${x - 1},${y},${z}`)) occ++;
+        if (occSet.has(`${x + 1},${y},${z}`)) occ++;
+        if (occSet.has(`${x},${y - 1},${z}`)) occ++;
+        if (occSet.has(`${x},${y + 1},${z}`)) occ++;
+        if (occSet.has(`${x},${y},${z - 1}`)) occ++;
+        if (occSet.has(`${x},${y},${z + 1}`)) occ++;
+      }
+      const aoFactor = Math.max(0.76, 1.0 - occ * 0.040);
+      aoColor.copy(baseColor).multiplyScalar(aoFactor);
+      meshRef.current!.setColorAt(i, aoColor);
     });
 
     meshRef.current.instanceMatrix.needsUpdate = true;
     meshRef.current.count = visibleVoxels.length;
-  }, [visibleVoxels, scale, xOff, yOff, zOff, tempMatrix, blockType]);
+    if (meshRef.current.instanceColor) {
+      meshRef.current.instanceColor.needsUpdate = true;
+    }
+  }, [visibleVoxels, scale, xOff, yOff, zOff, tempMatrix, blockType, color, occSet, texture]);
 
   const maxCount = voxels.length;
   if (maxCount === 0) return null;
-  const color = getPreviewColor(blockType);
+  const matProps = getBlockMaterialProps(blockType);
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, maxCount]} frustumCulled={false}>
+    <instancedMesh
+      ref={meshRef}
+      args={[undefined, undefined, maxCount]}
+      frustumCulled={false}
+      castShadow
+      receiveShadow
+    >
       <boxGeometry args={[geomW, geomH, geomD]} />
-      <meshLambertMaterial color={color} />
+      {/*
+       * color="white" so the instance color (which already encodes the
+       * block hue × AO factor) is not tinted a second time.
+       */}
+      <meshStandardMaterial
+        color="white"
+        map={texture ?? undefined}
+        roughness={matProps.roughness}
+        metalness={matProps.metalness}
+      />
     </instancedMesh>
   );
 }
@@ -219,8 +348,11 @@ function StairInstancedMesh({
   showBaseOnly,
   baseY,
   facing,
+  occSet,
+  colorMap,
+  texture,
 }: InstancedVoxelMeshProps & { facing: 'north' | 'south' | 'east' | 'west' }) {
-  const common = { voxels, blockType, scale, visibleMaxY, showBaseOnly, baseY };
+  const common = { voxels, blockType, scale, visibleMaxY, showBaseOnly, baseY, occSet, colorMap, texture };
 
   const isEW = facing === 'east' || facing === 'west';
   const upperGeomW = isEW ? 0.49 : 0.98;
@@ -254,6 +386,8 @@ interface SceneContentProps {
   scale: number;
   visibleMaxY: number;
   showBaseOnly: boolean;
+  colorMap?: Map<string, string> | null;
+  textureMap?: Map<string, THREE.Texture | null> | null;
 }
 
 /**
@@ -265,6 +399,8 @@ function SceneContent({
   scale,
   visibleMaxY,
   showBaseOnly,
+  colorMap,
+  textureMap,
 }: SceneContentProps) {
   // Center voxels if requested
   const voxels = useMemo(() => {
@@ -273,6 +409,16 @@ function SceneContent({
     }
     return voxelResult.voxels;
   }, [voxelResult, centered]);
+
+  // Global occupancy set for neighbor-based AO.
+  // Keyed by "${x},${y},${z}" in the same (possibly centered) coordinate space.
+  const occSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of voxels) {
+      set.add(`${v.x},${v.y},${v.z}`);
+    }
+    return set;
+  }, [voxels]);
 
   // Group voxels by (blockType + sub-variant) for shape-aware instanced rendering.
   // Slabs split by top/bottom; stairs split by facing direction.
@@ -332,11 +478,21 @@ function SceneContent({
 
   return (
     <>
-      {/* Lighting */}
-      <ambientLight intensity={0.5} />
-      <directionalLight position={[10, 20, 10]} intensity={0.7} />
-      <directionalLight position={[-10, 15, -10]} intensity={0.3} />
-      <pointLight position={[0, 30, 0]} intensity={0.4} />
+      {/* Minecraft-style lighting: soft hemisphere + shadow-casting sun */}
+      <ambientLight intensity={0.28} />
+      <hemisphereLight args={['#87CEEB', '#4a3520', 0.48]} />
+      <directionalLight
+        castShadow
+        position={[80, 100, 60]}
+        intensity={1.40}
+        shadow-mapSize={[2048, 2048]}
+        shadow-camera-near={0.1}
+        shadow-camera-far={600}
+        shadow-camera-left={-200}
+        shadow-camera-right={200}
+        shadow-camera-top={200}
+        shadow-camera-bottom={-200}
+      />
 
       {/* Camera controls */}
       <OrbitControls
@@ -365,6 +521,8 @@ function SceneContent({
 
       {/* Render each group — full blocks, slabs (half-height), or stairs (two-step) */}
       {Array.from(renderGroups.entries()).map(([key, meta]) => {
+        const clean   = meta.blockType.replace('minecraft:', '');
+        const texture = textureMap?.get(clean) ?? null;
         const common = {
           key,
           voxels: meta.voxels,
@@ -373,6 +531,9 @@ function SceneContent({
           visibleMaxY,
           showBaseOnly,
           baseY,
+          occSet,
+          colorMap,
+          texture,
         };
         if (meta.variant === 'slab-bottom') return <InstancedVoxelMesh {...common} geomH={0.49} yOff={-0.245} />;
         if (meta.variant === 'slab-top')    return <InstancedVoxelMesh {...common} geomH={0.49} yOff={0.245} />;
@@ -399,6 +560,12 @@ interface ControlsPanelProps {
   centered: boolean;
   setCentered: (center: boolean) => void;
   visibleCount: number;
+  colorMode: 'texture' | 'exact' | 'simple';
+  setColorMode: (mode: 'texture' | 'exact' | 'simple') => void;
+  colorLoading: boolean;
+  textureLoading: boolean;
+  colorMap?: Map<string, string> | null;
+  textureMap?: Map<string, THREE.Texture | null> | null;
 }
 
 /**
@@ -413,6 +580,12 @@ function ControlsPanel({
   centered,
   setCentered,
   visibleCount,
+  colorMode,
+  setColorMode,
+  colorLoading,
+  textureLoading,
+  colorMap,
+  textureMap,
 }: ControlsPanelProps) {
   const { bounds, totalCount, blockTypes } = voxelResult;
 
@@ -442,23 +615,83 @@ function ControlsPanel({
         </div>
       </div>
 
+      {/* Color mode toggle */}
+      <div className="mb-4">
+        <label className="text-sm text-gray-400 block mb-2">Render Mode</label>
+        <div className="flex gap-1 mb-1">
+          <button
+            onClick={() => setColorMode('texture')}
+            disabled={textureLoading}
+            className={`flex-1 py-1 rounded text-xs font-medium transition-colors ${
+              colorMode === 'texture'
+                ? 'bg-cyan-600 text-white'
+                : 'bg-slate-700 text-gray-300 hover:bg-slate-600'
+            }`}
+          >
+            {textureLoading && colorMode === 'texture' ? 'Loading…' : 'Textures'}
+          </button>
+          <button
+            onClick={() => setColorMode('exact')}
+            disabled={colorLoading}
+            className={`flex-1 py-1 rounded text-xs font-medium transition-colors ${
+              colorMode === 'exact'
+                ? 'bg-cyan-600 text-white'
+                : 'bg-slate-700 text-gray-300 hover:bg-slate-600'
+            }`}
+          >
+            {colorLoading && colorMode === 'exact' ? 'Loading…' : 'Colors'}
+          </button>
+          <button
+            onClick={() => setColorMode('simple')}
+            className={`flex-1 py-1 rounded text-xs font-medium transition-colors ${
+              colorMode === 'simple'
+                ? 'bg-cyan-600 text-white'
+                : 'bg-slate-700 text-gray-300 hover:bg-slate-600'
+            }`}
+          >
+            Simple
+          </button>
+        </div>
+        {colorMode === 'texture' && !textureLoading && textureMap && (
+          <p className="text-xs text-green-400 mt-1">
+            Rendering with Minecraft textures
+          </p>
+        )}
+        {colorMode === 'texture' && !textureLoading && !textureMap && (
+          <p className="text-xs text-amber-400 mt-1">
+            No textures found — add PNGs to<br />
+            <code className="text-amber-300">public/minecraft/textures/</code>
+          </p>
+        )}
+        {colorMode === 'exact' && !colorLoading && !colorMap && (
+          <p className="text-xs text-amber-400 mt-1">
+            Textures not found — using fallback colors
+          </p>
+        )}
+      </div>
+
       {/* Block type legend */}
       <div className="mb-4">
         <label className="text-sm text-gray-400 block mb-2">Block Types</label>
         <div className="flex flex-wrap gap-1">
-          {blockTypes.map(type => (
-            <div
-              key={type}
-              className="flex items-center gap-1 px-2 py-1 bg-slate-700/50 rounded text-xs"
-              title={type}
-            >
+          {blockTypes.map(type => {
+            const clean = type.replace('minecraft:', '');
+            const swatchColor = colorMap?.get(clean) ?? getPreviewColor(type);
+            // In texture mode fall back to color — canvas thumbnails not feasible here
+            return (
               <div
-                className="w-3 h-3 rounded-sm border border-white/30"
-                style={{ backgroundColor: getPreviewColor(type) }}
-              />
-              <span className="truncate max-w-20">{type.replace('minecraft:', '')}</span>
-            </div>
-          ))}
+                key={type}
+                className="flex items-center gap-1 px-2 py-1 bg-slate-700/50 rounded text-xs"
+                title={type}
+              >
+                <div
+                  className="w-3 h-3 rounded-sm border border-white/30"
+                  style={{ backgroundColor: swatchColor }}
+                />
+                <span className="truncate max-w-20">{clean}</span>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -610,6 +843,65 @@ export function VoxelPreview({
   const [showBaseOnly, setShowBaseOnly] = useState(false);
   const [centered, setCentered] = useState(centerByDefault);
 
+  // Color / texture mode state
+  const [colorMode, setColorMode] = useState<'texture' | 'exact' | 'simple'>('texture');
+  const [colorMap, setColorMap] = useState<Map<string, string> | null>(null);
+  const [colorLoading, setColorLoading] = useState(false);
+  const [textureMap, setTextureMap] = useState<Map<string, THREE.Texture | null> | null>(null);
+  const [textureLoading, setTextureLoading] = useState(false);
+
+  // Load texture-derived colors when mode is 'exact'
+  useEffect(() => {
+    if (colorMode !== 'exact') {
+      setColorMap(null);
+      return;
+    }
+    let cancelled = false;
+    setColorLoading(true);
+    loadAllBlockColors('/minecraft/terrain_texture.png')
+      .then(map => {
+        if (!cancelled) {
+          setColorMap(map);
+          setColorLoading(false);
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          console.warn('minecraftColors: texture load failed, using fallback palette.', err);
+          setColorMap(null);
+          setColorLoading(false);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [colorMode]);
+
+  // Load THREE.js textures when mode is 'texture'
+  useEffect(() => {
+    if (colorMode !== 'texture' || !voxelResult) {
+      setTextureMap(null);
+      return;
+    }
+    let cancelled = false;
+    setTextureLoading(true);
+    loadBlockTextures(voxelResult.blockTypes)
+      .then(map => {
+        if (!cancelled) {
+          // Consider the map valid if at least one texture loaded successfully
+          const hasAny = Array.from(map.values()).some(t => t !== null);
+          setTextureMap(hasAny ? map : null);
+          setTextureLoading(false);
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          console.warn('textureManager: texture load failed.', err);
+          setTextureMap(null);
+          setTextureLoading(false);
+        }
+      });
+    return () => { cancelled = true; };
+  }, [colorMode, voxelResult]);
+
   // Initialize visibleMaxY when voxelResult changes
   useEffect(() => {
     if (voxelResult) {
@@ -618,7 +910,6 @@ export function VoxelPreview({
   }, [voxelResult]);
 
   // Calculate visible voxel count
-    const baseY = centered ? 0 : voxelResult.bounds.minY;
   const visibleCount = useMemo(() => {
     if (!voxelResult) return 0;
     
@@ -661,6 +952,7 @@ export function VoxelPreview({
   return (
     <div className={`relative w-full h-full ${className}`}>
       <Canvas
+        shadows={{ type: THREE.PCFSoftShadowMap }}
         camera={{
           position: [cameraDistance, cameraDistance * 0.8, cameraDistance],
           fov: 50,
@@ -675,6 +967,8 @@ export function VoxelPreview({
           scale={scale}
           visibleMaxY={visibleMaxY}
           showBaseOnly={showBaseOnly}
+          colorMap={colorMode === 'exact' ? colorMap : null}
+          textureMap={colorMode === 'texture' ? textureMap : null}
         />
       </Canvas>
 
@@ -687,6 +981,12 @@ export function VoxelPreview({
         centered={centered}
         setCentered={setCentered}
         visibleCount={visibleCount}
+        colorMode={colorMode}
+        setColorMode={setColorMode}
+        colorLoading={colorLoading}
+        textureLoading={textureLoading}
+        colorMap={colorMode === 'exact' ? colorMap : null}
+        textureMap={colorMode === 'texture' ? textureMap : null}
       />
     </div>
   );

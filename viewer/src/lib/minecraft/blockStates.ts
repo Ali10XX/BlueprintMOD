@@ -139,21 +139,6 @@ const POWERED_BIT: StateProperty = {
   description: 'true if powered',
 };
 
-/** Attachment type for bells, grindstones */
-const ATTACHMENT: StateProperty = {
-  name: 'attachment',
-  values: ['standing', 'hanging', 'side', 'multiple'],
-  default: 'standing',
-};
-
-/** Age for crops, saplings */
-const AGE: StateProperty = {
-  name: 'age',
-  values: [0, 1, 2, 3, 4, 5, 6, 7],
-  default: 0,
-  description: 'Growth stage',
-};
-
 // ============================================================================
 // BLOCK STATE DEFINITIONS
 // ============================================================================
@@ -805,7 +790,7 @@ export function getDefaultStates(blockType: string): BlockStates {
   if (!def) return {};
   
   const states: BlockStates = {};
-  for (const [key, prop] of Object.entries(def.properties)) {
+  for (const [_key, prop] of Object.entries(def.properties)) {
     states[prop.name] = prop.default;
   }
   return states;
@@ -823,7 +808,7 @@ export function validateStates(blockType: string, states: BlockStates): BlockSta
   
   const validated: BlockStates = {};
   
-  for (const [key, prop] of Object.entries(def.properties)) {
+  for (const [_key, prop] of Object.entries(def.properties)) {
     const value = states[prop.name];
     
     if (value !== undefined && (prop.values as StateValue[]).includes(value)) {

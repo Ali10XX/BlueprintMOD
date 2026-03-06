@@ -138,6 +138,68 @@ Minecraft blueprint/
 
 ---
 
+---
+
+## Importing the Al-Shaheed Monument
+
+The web viewer can export a procedural Al-Shaheed Monument blueprint as a
+ready-to-use Bedrock `.mcstructure` file.
+
+### Step 1 — Export from the viewer
+
+1. Open the viewer in your browser (`npm run dev` → `http://localhost:5173`)
+2. Navigate to the **VoxelPreview Demo** page
+3. Click **Export .mcstructure** — your browser downloads `al_shaheed.mcstructure`
+
+### Step 2 — Copy the file into Bedrock
+
+Press `Win + R`, paste the path below, press Enter:
+
+```
+%LOCALAPPDATA%\Packages\Microsoft.MinecraftUWP_8wekyb3d8bbwe\LocalState\games\com.mojang\
+```
+
+Copy `al_shaheed.mcstructure` into:
+
+```
+structures\al_shaheed.mcstructure
+```
+
+> **Tip:** The `structures` folder may not exist yet — create it if needed.
+
+### Step 3 — Load in-game
+
+**Option A — Structure Block (recommended)**
+
+1. Get a structure block: `/give @s structure_block`
+2. Place it, set mode to **Load**
+3. Enter structure name: `al_shaheed`
+4. Click **Load**
+
+**Option B — Command**
+
+```
+/structure load al_shaheed ~ ~ ~
+```
+
+### Block palette
+
+| Block | Role |
+|-------|------|
+| `minecraft:prismarine` | Shell body (≈50 %) |
+| `minecraft:prismarine_bricks` | Shell accent (≈30 %), rim band |
+| `minecraft:dark_prismarine` | Shell shadow patches (≈20 %) |
+| `minecraft:prismarine_stairs` | Curvature transitions |
+| `minecraft:prismarine_slab` | Curvature transitions |
+| `minecraft:smooth_quartz_block` | Plinth base |
+
+### Requirements
+
+- Minecraft Bedrock **1.20+**
+- No behavior pack required — the structure uses vanilla blocks only
+
+---
+
 ## Troubleshooting
 
 **"nbtlib not found"**

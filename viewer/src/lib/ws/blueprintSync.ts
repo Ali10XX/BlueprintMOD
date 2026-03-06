@@ -66,6 +66,7 @@ const API_BASE = 'http://localhost:3001';
 class BlueprintSyncClient {
   private statusCallbacks: Set<StatusCallback> = new Set();
   private connectionCallbacks: Set<ConnectionCallback> = new Set();
+  // @ts-ignore - NodeJS.Timeout type only available in Node environment
   private pollInterval: NodeJS.Timeout | null = null;
   private lastStatus: SyncStatus | null = null;
   private connectionStatus: ConnectionStatus = 'disconnected';
