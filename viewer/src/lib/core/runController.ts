@@ -10,7 +10,9 @@
  * 6. Every failure produces a reason code
  */
 
+// @ts-ignore - Node.js types only available in backend environment
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
+// @ts-ignore - Node.js types only available in backend environment
 import { join } from 'path';
 
 // ============================================================================
@@ -90,14 +92,6 @@ const DEFAULT_BUDGET: RunBudget = {
   maxRuntimeMs: 15 * 60 * 1000,  // 15 minutes
   maxAiCalls: 0,  // AI disabled by default in MVP
 };
-
-const STAGE_ORDER: StageName[] = [
-  'frame_extraction',
-  'reconstruction',
-  'alignment',
-  'voxelization',
-  'export',
-];
 
 // ============================================================================
 // RUN CONTROLLER (SINGLETON)

@@ -27,7 +27,6 @@ import {
   failRequest,
   getRequestLog,
   clearRequestLog,
-  RATE_LIMIT_CONFIG,
   type RequestLogEntry,
 } from './rateLimiter';
 
@@ -522,7 +521,7 @@ export async function detectBlocksFromFrame(
       
     } catch (error) {
       lastError = error as Error;
-      const duration = Date.now() - startTime;
+      // Duration tracking removed to avoid unused variable warning
       const errorMsg = lastError.message || String(error);
       
       console.error(`[Gemini] geminiDetector.ts: Request #${requestId}: FAILED (attempt ${attempt}/${maxAttempts}): ${errorMsg.substring(0, 150)}`);

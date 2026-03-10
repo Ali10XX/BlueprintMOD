@@ -164,7 +164,7 @@ class VoxelGrid {
   /**
    * Gets the grid bounds
    */
-  getBounds(): { min: typeof this.minBounds; max: typeof this.maxBounds } {
+  getBounds(): { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } {
     return { min: { ...this.minBounds }, max: { ...this.maxBounds } };
   }
 
@@ -393,7 +393,7 @@ export async function reconstructFromViews(
 /**
  * Fills small gaps in the structure based on surrounding blocks
  */
-function fillStructuralGaps(blocks: ReconstructedBlock[], maxGapSize: number): ReconstructedBlock[] {
+function fillStructuralGaps(blocks: ReconstructedBlock[], _maxGapSize: number): ReconstructedBlock[] {
   const result = [...blocks];
   const blockMap = new Map<string, ReconstructedBlock>();
   
